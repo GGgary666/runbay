@@ -1,0 +1,8 @@
+[package]
+name = "runbayd"
+description = "Runbay daemon — local runtime supervisor for coding-agent sessions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
