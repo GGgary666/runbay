@@ -1,0 +1,22 @@
+[package]
+name = "runbay-mvcc"
+description = "L0 CAS hardlink store, L1 CoW MVCC/branching workspace store, and L2 shared versioned derived index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hex.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+regex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
