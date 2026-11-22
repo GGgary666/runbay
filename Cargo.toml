@@ -6,6 +6,7 @@ members = [
     "crates/runbay-gateway",
     "crates/runbay-scheduler",
     "crates/runbayd",
+    "beta-bench",
 ]
 
 [workspace.package]

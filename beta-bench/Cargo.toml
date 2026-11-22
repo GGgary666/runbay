@@ -1,0 +1,23 @@
+[package]
+name = "runbay-beta-bench"
+description = "Reproducible Rust beta benchmark suite for Runbay runtime pool, MVCC/CoW storage, OS sandbox, secretless gateway, and scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "beta-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+runbay-gateway = { path = "../crates/runbay-gateway" }
+runbay-mvcc = { path = "../crates/runbay-mvcc" }
+runbay-sandbox = { path = "../crates/runbay-sandbox" }
+runbay-scheduler = { path = "../crates/runbay-scheduler" }
+tempfile.workspace = true
+tokio.workspace = true

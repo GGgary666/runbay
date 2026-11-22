@@ -1,0 +1,110 @@
+[
+  {
+    "trace_id": "qwen-tool-00",
+    "task_kind": "tool_call_specbox",
+    "model": "qwen-flash",
+    "ttft_ms": 1671.41,
+    "total_llm_ms": 2037.14,
+    "tool_name_detect_ms": 1671.42,
+    "specbox_hidden_window_ms": 365.71,
+    "prompt_tokens": 325,
+    "cached_tokens": 0,
+    "completion_tokens": 74,
+    "tool_calls": [
+      {
+        "id": "call_d6d11aeba20442468186b2",
+        "name": "search_workspace",
+        "arguments": "{\"query\": \"rollback quorum rule\", \"rationale\": \"To determine the required number of approvals or consensus needed to initiate a rollback, I need to locate the official policy or runbook that defines the rollback quorum rule. This is critical for ensuring compliance with organizational standards during incident response.\"}"
+      }
+    ],
+    "response_preview": "[{\"id\": \"call_d6d11aeba20442468186b2\", \"name\": \"search_workspace\", \"arguments\": \"{\\\"query\\\": \\\"rollback quorum rule\\\", \\\"rationale\\\": \\\"To determine the required number of approval"
+  },
+  {
+    "trace_id": "qwen-tool-01",
+    "task_kind": "tool_call_specbox",
+    "model": "qwen-flash",
+    "ttft_ms": 4317.5,
+    "total_llm_ms": 5177.21,
+    "tool_name_detect_ms": 4317.51,
+    "specbox_hidden_window_ms": 859.7,
+    "prompt_tokens": 327,
+    "cached_tokens": 256,
+    "completion_tokens": 178,
+    "tool_calls": [
+      {
+        "id": "call_7224b5e0a8bd48238030fc",
+        "name": "run_sandbox_shell",
+        "arguments": "{\"explanation\": \"Verify the contents of the docs/ directory and check for canary lines to ensure integrity and presence of expected files.\", \"script\": \"import os\\n\\n# List files in the docs/ directory\\ndocs_files = os.listdir('docs/')\\nprint('Files in docs/:', docs_files)\\n\\n# Check for canary lines in example files\\nfor file in docs_files:\\n    file_path = f'docs/{file}'\\n    if os.path.isfile(file_path):\\n        with open(file_path, 'r') as f:\\n            lines = f.readlines()\\n            for line in lines:\\n                if 'canary' in line.lower():\\n                    print(f'Canary line found in {file}: {line.strip()}')\"}"
+      }
+    ],
+    "response_preview": "[{\"id\": \"call_7224b5e0a8bd48238030fc\", \"name\": \"run_sandbox_shell\", \"arguments\": \"{\\\"explanation\\\": \\\"Verify the contents of the docs/ directory and check for canary lines to ensur"
+  },
+  {
+    "trace_id": "qwen-tool-02",
+    "task_kind": "tool_call_specbox",
+    "model": "qwen-flash",
+    "ttft_ms": 1781.87,
+    "total_llm_ms": 2360.68,
+    "tool_name_detect_ms": 1781.87,
+    "specbox_hidden_window_ms": 578.81,
+    "prompt_tokens": 323,
+    "cached_tokens": 256,
+    "completion_tokens": 86,
+    "tool_calls": [
+      {
+        "id": "call_798f4dc56e984bcf947a5f",
+        "name": "search_workspace",
+        "arguments": "{\"query\": \"latency budget thresholds AND SLA rules\", \"rationale\": \"To ensure accurate understanding of performance requirements and compliance standards, I need to retrieve the latest documented latency budget thresholds and SLA rules from the versioned workspace. This information is critical for assessing system behavior, setting appropriate alerts, and validating service performance against agreed-upon metrics.\"}"
+      }
+    ],
+    "response_preview": "[{\"id\": \"call_798f4dc56e984bcf947a5f\", \"name\": \"search_workspace\", \"arguments\": \"{\\\"query\\\": \\\"latency budget thresholds AND SLA rules\\\", \\\"rationale\\\": \\\"To ensure accurate unders"
+  },
+  {
+    "trace_id": "qwen-tool-03",
+    "task_kind": "tool_call_specbox",
+    "model": "qwen-flash",
+    "ttft_ms": 5244.04,
+    "total_llm_ms": 5911.98,
+    "tool_name_detect_ms": 5244.05,
+    "specbox_hidden_window_ms": 667.93,
+    "prompt_tokens": 325,
+    "cached_tokens": 0,
+    "completion_tokens": 124,
+    "tool_calls": [
+      {
+        "id": "call_cd59000a0c674319a115e9",
+        "name": "run_sandbox_shell",
+        "arguments": "{\"explanation\": \"Verify that the workspace documentation files have consistent headers and correct line counts to ensure integrity and readability.\", \"script\": \"for file in docs/*.md; do\\n  if [ -f \\\"$file\\\" ]; then\\n    header_count=$(grep -c '^# ' \\\"$file\\\")\\n    line_count=$(wc -l \\\"$file\\\" | awk '{print $1}')\\n    echo \\\"File: $file, Headers: $header_count, Lines: $line_count\\\"\\n  fi\\ndone\"}"
+      }
+    ],
+    "response_preview": "[{\"id\": \"call_cd59000a0c674319a115e9\", \"name\": \"run_sandbox_shell\", \"arguments\": \"{\\\"explanation\\\": \\\"Verify that the workspace documentation files have consistent headers and corr"
+  },
+  {
+    "trace_id": "qwen-prefix-00",
+    "task_kind": "long_prefix_qa",
+    "model": "qwen-flash",
+    "ttft_ms": 2208.82,
+    "total_llm_ms": 2680.14,
+    "tool_name_detect_ms": null,
+    "specbox_hidden_window_ms": 0.0,
+    "prompt_tokens": 3366,
+    "cached_tokens": 3200,
+    "completion_tokens": 20,
+    "tool_calls": [],
+    "response_preview": "According to Doc 12, the max p95 latency is 156ms."
+  },
+  {
+    "trace_id": "qwen-prefix-01",
+    "task_kind": "long_prefix_qa",
+    "model": "qwen-flash",
+    "ttft_ms": 2396.19,
+    "total_llm_ms": 3067.37,
+    "tool_name_detect_ms": null,
+    "specbox_hidden_window_ms": 0.0,
+    "prompt_tokens": 3369,
+    "cached_tokens": 0,
+    "completion_tokens": 29,
+    "tool_calls": [],
+    "response_preview": "According to Doc 44, the max p95 latency is 252ms and the escalation channel is #ops-2."
+  }
+]
