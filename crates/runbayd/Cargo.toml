@@ -6,3 +6,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+runbay-gateway = { path = "../runbay-gateway" }
+runbay-mvcc = { path = "../runbay-mvcc" }
+runbay-sandbox = { path = "../runbay-sandbox" }
+runbay-scheduler = { path = "../runbay-scheduler" }
+tempfile.workspace = true
+tokio.workspace = true
