@@ -1,0 +1,42 @@
+name: Runbay Rust CI (Linux & macOS)
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux sandbox tooling (bubblewrap)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap curl
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Run full workspace unit & OS kernel integration tests
+        run: cargo test --workspace -- --nocapture
+
+      - name: Run runbayd self-check
+        run: cargo run -p runbayd -- self-check
+
+      - name: Run beta-bench release suite
+        run: |
+          cargo run -p runbay-beta-bench --release -- \
+            --traces beta-bench/fixtures/recorded_llm_traces.json \
+            --out /tmp/beta_bench_ci_results.json
+          python3 -c 'import json; d=json.load(open("/tmp/beta_bench_ci_results.json")); assert d["correctness_oracle"]["all_invariants_passed"] is True, d["correctness_oracle"]'
