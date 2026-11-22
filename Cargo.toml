@@ -4,6 +4,7 @@ members = [
     "crates/runbay-mvcc",
     "crates/runbay-sandbox",
     "crates/runbay-gateway",
+    "crates/runbay-scheduler",
     "crates/runbayd",
 ]
 
