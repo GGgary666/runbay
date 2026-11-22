@@ -58,21 +58,30 @@ backoff (exp.) ──► terminal_failure (manual reset)        cold (metadata +
 - **SSE** streams for live output, tool events, lifecycle transitions, and gateway cost/cache telemetry.
 - **Exported runtime signals**: `state`, `context_fill_ratio`, `cache_warm_until`, `workspace_rev`, `cost_usd`, `cache_read_tokens`, `ttft_ms`, and structured `last_error` (`rate_limit | auth | runtime_crash | stale_rev`).
 
-### Planned V1 Control API Sketch
+### Control API (Implemented vs Planned)
+
+**Implemented in `runbayd serve` today:**
 
 ```text
-GET    /health                      liveness check
-GET    /v1/status                   daemon version and enabled subsystems
-POST   /agents                      register agent {agent_id, runtime, workspace_dir, config}
-GET    /agents                      list agents + tier + health/cache signals
-GET    /agents/:id                  agent status and telemetry
-POST   /agents/:id/run              start/continue a turn {prompt, priority?, required_rev?} -> run_id
-POST   /agents/:id/wake             content-free wake notification
+GET    /health                      unauthenticated liveness check
+GET    /v1/status                   authenticated daemon status, adapters, sandbox & live queue metrics
+POST   /agents                      register agent {agent_id, runtime, workspace_dir, config?}
+GET    /agents                      list agents + capability tier + MVCC lease counts
+GET    /agents/:id                  agent status and active run pointer
+DELETE /agents/:id                  cancel active runs and delete isolated agent state
+POST   /agents/:id/run              submit a one-shot run {prompt, priority?, required_rev?, timeout_secs?, allowed_model?, sandbox_mode?}
 GET    /agents/:id/events           SSE stream scoped to agent
-GET    /runs/:run_id                run status, diff summary, and cost/cache metrics
-POST   /runs/:run_id/steer          inject a steer message into a queued/running turn
-DELETE /agents/:id                  stop process and optionally prune workspace
+GET    /runs                        list recent runs (?agent_id=...)
+GET    /runs/:run_id                run state (queued|running|succeeded|failed|cancelled), exit code, sandbox/gateway metadata
+POST   /runs/:run_id/cancel         cancel queued/running turn, kill+reap POSIX process group, revoke gateway token, release MVCC lease
+GET    /runs/:run_id/events         bounded SSE stream with Last-Event-ID / ?after_seq= replay (disconnect-safe)
+```
 
+**Planned (not yet exposed over HTTP):**
+
+```text
+POST   /agents/:id/wake             content-free wake notification
+POST   /runs/:run_id/steer          inject a steer message into a duplex/hot turn
 POST   /workspaces/:id/fork         O(1) CoW fork of workspace snapshot -> branch_id
 POST   /workspaces/:id/commit       atomically commit winning branch & abort siblings
 POST   /workspaces/:id/abort        discard speculative branch workspace
@@ -117,18 +126,19 @@ trait RuntimeAdapter {
 ## 6. Cross-Platform OS Sandbox & Secretless Gateway
 
 ### OS Subprocess Sandbox (`runbay-sandbox`)
-- **macOS (`MacOSSeatbeltSandbox`)**: global `(deny file-write*)` write baseline allowing writes solely to `allowed_workspace` and `/dev/null`, explicit read denial on sibling pool slots and protected secret paths, L0 read-only allowlists, and `(deny network*)` with optional loopback port exception for the gateway.
-- **Linux (`LinuxBubblewrapSandbox`)**: unprivileged `bwrap` namespaces with `--ro-bind / /` (zero arbitrary host writes), `--tmpfs` masking of pool and secret paths, `--ro-bind` for L0, `--bind` for `allowed_workspace`, and `--unshare-net`.
+- **macOS (`MacOSSeatbeltSandbox`)**: global `(deny file-write*)` write baseline allowing writes solely to `allowed_workspace`, isolated per-agent `home_dir`, and `/dev/null`; explicit read denial on sibling pool slots and protected secret paths (with metadata-only ancestor `lstat` so `realpath(3)` succeeds on the agent's own workspace/home); L0 read-only allowlists; `(deny network*)` with optional loopback port or Unix-socket exception for the gateway.
+- **Linux (`LinuxBubblewrapSandbox`)**: unprivileged `bwrap` namespaces with `--ro-bind / /` (zero arbitrary host writes), `--tmpfs` masking of pool and secret paths, `--ro-bind` for L0, `--bind` for `allowed_workspace` and isolated `home_dir`, and unconditional `--unshare-net` when `allow_network=false`. Gateway access under `--unshare-net` uses a bound Unix domain socket (`--bind <sock> <sock>`); requesting `allow_network=false` with a TCP-only loopback port fails closed rather than silently dropping `--unshare-net`.
+- **Process-Group Supervision (`SandboxedChild`)**: every async sandboxed run starts in its own POSIX process group (`setpgid(0, 0)`) so cancellation and timeouts cleanly signal and reap the entire child/grandchild tree.
 - **Quarantine (`QuarantineRegistry`)**: permanently retires worker slots whose post-run cleanup fails.
 
 ### Secretless Loopback Model Gateway (`runbay-gateway`)
-- Binds `127.0.0.1:0` and injects real upstream API keys strictly on outbound hops; sandboxed processes receive only ephemeral 256-bit CSPRNG `rb_*` tokens.
+- Binds `127.0.0.1:0` (and optional Unix domain sockets via `bind_unix_socket` for Linux `--unshare-net`) and injects real upstream API keys strictly on outbound hops; sandboxed processes receive only ephemeral 256-bit CSPRNG `rb_*` tokens.
 - Enforces an explicit route allowlist (`/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`), verifies unchanged trusted upstream origin, and enforces optional per-token `allowed_model` restrictions (`403 Forbidden`).
 - Passively parses SSE usage telemetry, detects tool names mid-stream to invoke prewarm callbacks (surfacing any callback errors explicitly), and wakes pending or stalled streams immediately upon token revocation via `tokio::sync::Notify`.
 
 ---
 
-## 7. Priority & Dual-Warm-Affinity Scheduler (`runbay-scheduler`)
+## 7. Cancellation Guard, Live Queue & Policy Simulator (`runbay-scheduler`)
 
-- **`CancelToken` + `GuardedRunSink`**: guarantees zero late-event delivery after cancellation.
-- **Scheduling Policies**: compares `fifo`, `priority_aging` (interactive priority with bounded background anti-starvation aging), `warm_env_affinity` (tenant/revision workspace affinity), and `dual_cache_ttl_aware` (Earliest-Expiry-First rescue boost for long-prefix hot sessions approaching upstream prompt-cache TTL expiration).
+- **Live in `runbayd`**: atomic `CancelToken` + `GuardedRunSink` guaranteeing zero late-event delivery after abort, paired with a bounded live concurrency/queue gate (`--max-concurrent-runs` / `--max-queued-runs` -> `429 Too Many Requests`).
+- **Simulated in `beta-bench`**: `simulate_scheduler_policy` compares `fifo`, `priority_aging`, `warm_env_affinity`, and `dual_cache_ttl_aware` in a discrete-event simulator (planned for live daemon integration in Issue #5).

@@ -235,7 +235,9 @@ impl SharedOutOfSandboxDerivedProxy {
                 db_path: hist_path,
                 encoder: frozen_enc,
             };
-            self.pinned_snapshots.write().insert(target_rev, handle.clone());
+            self.pinned_snapshots
+                .write()
+                .insert(target_rev, handle.clone());
             return Ok((handle, 0.0));
         }
 
@@ -246,7 +248,9 @@ impl SharedOutOfSandboxDerivedProxy {
                 db_path: hist_path,
                 encoder: w.layer.encoder(),
             };
-            self.pinned_snapshots.write().insert(target_rev, handle.clone());
+            self.pinned_snapshots
+                .write()
+                .insert(target_rev, handle.clone());
             return Ok((handle, 0.0));
         }
 
@@ -286,7 +290,9 @@ impl SharedOutOfSandboxDerivedProxy {
             db_path: hist_path,
             encoder: w.layer.encoder(),
         };
-        self.pinned_snapshots.write().insert(target_rev, handle.clone());
+        self.pinned_snapshots
+            .write()
+            .insert(target_rev, handle.clone());
         Ok((handle, dt_ms))
     }
 
@@ -356,7 +362,9 @@ impl SharedOutOfSandboxDerivedProxy {
         let snap = self.store.latest_snapshot();
         let (inc_handle, _) = self.ensure_snapshot_handle(snap.rev)?;
 
-        let fresh_db = self.proxy_dir.join(format!("verify_fresh_rev_{}.sqlite", snap.rev));
+        let fresh_db = self
+            .proxy_dir
+            .join(format!("verify_fresh_rev_{}.sqlite", snap.rev));
         if fresh_db.exists() {
             let _ = fs::remove_file(&fresh_db);
         }
@@ -365,7 +373,9 @@ impl SharedOutOfSandboxDerivedProxy {
             inc_handle.encoder.dim,
             inc_handle.encoder.max_vocab,
         )?;
-        let full_ms = fresh_layer.rebuild_all(&snap.root_dir, &snap.snapshot_id)?.build_ms;
+        let full_ms = fresh_layer
+            .rebuild_all(&snap.root_dir, &snap.snapshot_id)?
+            .build_ms;
 
         let inc_conn = Connection::open_with_flags(
             &inc_handle.db_path,
@@ -404,7 +414,8 @@ impl SharedOutOfSandboxDerivedProxy {
         let mut inc_vecs: HashMap<String, String> = HashMap::new();
         {
             let mut stmt = inc_conn.prepare("SELECT block_id, vec_json FROM blocks")?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows {
                 let (bid, vj) = row?;
                 inc_vecs.insert(bid, vj);
@@ -444,8 +455,8 @@ impl SharedOutOfSandboxDerivedProxy {
             blocks_table_bit_identical: blocks_identical,
             fts5_bm25_exact_match: mismatches.is_empty(),
             frozen_encoder_vectors_identical: frozen_vec_mismatches == 0,
-            encoder_equivalence_scope:
-                "frozen_projection_basis (full SVD refit changes basis)".to_string(),
+            encoder_equivalence_scope: "frozen_projection_basis (full SVD refit changes basis)"
+                .to_string(),
             exact_equivalence: exact,
             mismatches,
             full_rebuild_ms: full_ms,

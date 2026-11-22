@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxExecResult {
@@ -21,10 +22,67 @@ pub struct SandboxExecResult {
 #[derive(Debug, Clone, Default)]
 pub struct SandboxRunOptions {
     pub extra_readonly_paths: Vec<PathBuf>,
+    pub extra_writable_paths: Vec<PathBuf>,
     pub extra_forbidden_reads: Vec<PathBuf>,
     pub allow_network: bool,
     pub allowed_loopback_port: Option<u16>,
+    /// Unix domain socket path bound into the sandbox for secretless gateway access
+    /// under `--unshare-net` on Linux (and allowed as a literal outbound socket on macOS).
+    pub gateway_unix_socket: Option<PathBuf>,
     pub env_overrides: BTreeMap<String, String>,
+}
+
+/// Async child process running inside an OS sandbox and its own POSIX process group.
+pub struct SandboxedChild {
+    pub child: tokio::process::Child,
+    pgid: Option<i32>,
+    _profile_guard: Option<NamedTempFile>,
+}
+
+impl SandboxedChild {
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    pub fn pgid(&self) -> Option<i32> {
+        self.pgid
+    }
+
+    /// Terminate the entire POSIX process group (`SIGTERM` -> grace -> `SIGKILL`) and reap the child.
+    pub async fn terminate_process_group(&mut self, grace: Duration) -> Result<ExitStatus> {
+        if let Some(status) = self.child.try_wait()? {
+            return Ok(status);
+        }
+
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            if pgid > 0 {
+                unsafe {
+                    libc::kill(-pgid, libc::SIGTERM);
+                }
+            }
+        }
+
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            if pgid > 0 {
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+        }
+        let _ = self.child.start_kill();
+        let status = self.child.wait().await?;
+        Ok(status)
+    }
 }
 
 fn sb_escape(path: &Path) -> String {
@@ -106,10 +164,46 @@ impl MacOSSeatbeltSandbox {
             lines.push(format!("(deny file-read* (subpath \"{esc}\"))"));
         }
 
+        // Allow metadata-only stat on exact ancestor directories leading from `pool_root`
+        // to this run's own allowed workspace / writable dirs so `realpath(3)` / `fs::canonicalize`
+        // succeeds without exposing directory listing (`file-read-data`) or sibling slots.
+        let mut metadata_ancestors: Vec<PathBuf> = Vec::new();
+        let ws_real_path =
+            fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
+        for target in std::iter::once(&ws_real_path).chain(opts.extra_writable_paths.iter()) {
+            let target_real = fs::canonicalize(target).unwrap_or_else(|_| target.clone());
+            if target_real.starts_with(&self.pool_root) {
+                let mut cur = target_real.parent();
+                while let Some(anc) = cur {
+                    if !anc.starts_with(&self.pool_root) {
+                        break;
+                    }
+                    if !metadata_ancestors.iter().any(|p| p == anc) {
+                        metadata_ancestors.push(anc.to_path_buf());
+                    }
+                    if anc == self.pool_root {
+                        break;
+                    }
+                    cur = anc.parent();
+                }
+            }
+        }
+        for anc in &metadata_ancestors {
+            let esc = sb_escape(anc);
+            lines.push(format!("(allow file-read-metadata (literal \"{esc}\"))"));
+        }
+
         // Allow shared read-only L0 layers
         for ro in &opts.extra_readonly_paths {
             let esc = sb_escape(ro);
             lines.push(format!("(allow file-read* (subpath \"{esc}\"))"));
+        }
+
+        // Allow explicitly scoped per-agent writable paths (e.g., isolated agent home)
+        for rw in &opts.extra_writable_paths {
+            let esc = sb_escape(rw);
+            lines.push(format!("(allow file-read* (subpath \"{esc}\"))"));
+            lines.push(format!("(allow file-write* (subpath \"{esc}\"))"));
         }
 
         // Allow read + write strictly inside this run's isolated workspace (+ /dev/null)
@@ -124,9 +218,73 @@ impl MacOSSeatbeltSandbox {
                     "(allow network-outbound (remote ip \"localhost:{port}\"))"
                 ));
             }
+            if let Some(ref sock) = opts.gateway_unix_socket {
+                let esc = sb_escape(sock);
+                lines.push(format!("(allow network-outbound (literal \"{esc}\"))"));
+                lines.push(format!("(allow file-read* (literal \"{esc}\"))"));
+                lines.push(format!("(allow file-write* (literal \"{esc}\"))"));
+            }
         }
 
         lines.join("\n") + "\n"
+    }
+
+    pub fn spawn_async(
+        &self,
+        cmd: &[String],
+        allowed_workspace: &Path,
+        opts: &SandboxRunOptions,
+    ) -> Result<SandboxedChild> {
+        let Some(ref sb_bin) = self.sandbox_exec_bin else {
+            bail!("macOS sandbox-exec is unavailable on this host");
+        };
+        if cmd.is_empty() {
+            bail!("sandbox command cannot be empty");
+        }
+
+        let profile_text = self.build_profile(allowed_workspace, opts);
+        let ws_real =
+            fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
+
+        let mut tf = tempfile::Builder::new().suffix(".sb").tempfile()?;
+        std::io::Write::write_all(&mut tf, profile_text.as_bytes())?;
+        let profile_path = tf.path().to_path_buf();
+
+        let mut command = tokio::process::Command::new(sb_bin);
+        command.arg("-f").arg(&profile_path);
+        for arg in cmd {
+            command.arg(arg);
+        }
+        command.current_dir(&ws_real);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        command.env_clear();
+        command.env("PATH", "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin");
+        command.env("HOME", &ws_real);
+        command.env("PYTHONDONTWRITEBYTECODE", "1");
+        for (k, v) in &opts.env_overrides {
+            command.env(k, v);
+        }
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn sandboxed process {:?}", cmd))?;
+        let pgid = child.id().map(|id| id as i32);
+        Ok(SandboxedChild {
+            child,
+            pgid,
+            _profile_guard: Some(tf),
+        })
     }
 
     pub fn run(
@@ -143,8 +301,8 @@ impl MacOSSeatbeltSandbox {
         }
 
         let profile_text = self.build_profile(allowed_workspace, opts);
-        let ws_real = fs::canonicalize(allowed_workspace)
-            .unwrap_or_else(|_| allowed_workspace.to_path_buf());
+        let ws_real =
+            fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
 
         let mut tf = tempfile::Builder::new().suffix(".sb").tempfile()?;
         std::io::Write::write_all(&mut tf, profile_text.as_bytes())?;
@@ -229,14 +387,29 @@ impl LinuxBubblewrapSandbox {
     }
 
     /// Build the exact `bwrap` argument list (testable on all platforms!).
+    ///
+    /// Fails closed if `!allow_network` is combined with `allowed_loopback_port` without
+    /// a `gateway_unix_socket`: `bwrap` cannot allow a single host TCP loopback port without
+    /// disabling `--unshare-net`, which would silently expose host networking.
     pub fn build_bwrap_args(
         &self,
         cmd: &[String],
         allowed_workspace: &Path,
         opts: &SandboxRunOptions,
-    ) -> Vec<String> {
-        let ws_real = fs::canonicalize(allowed_workspace)
-            .unwrap_or_else(|_| allowed_workspace.to_path_buf());
+    ) -> Result<Vec<String>> {
+        if !opts.allow_network
+            && opts.allowed_loopback_port.is_some()
+            && opts.gateway_unix_socket.is_none()
+        {
+            bail!(
+                "FAIL_CLOSED: Linux bwrap cannot restrict network access to a single host TCP \
+                 loopback port without disabling --unshare-net; bind a gateway_unix_socket \
+                 (under --unshare-net) or explicitly set allow_network=true"
+            );
+        }
+
+        let ws_real =
+            fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
         let ws_s = ws_real.to_string_lossy().to_string();
         let pool_s = self.pool_root.to_string_lossy().to_string();
 
@@ -278,6 +451,24 @@ impl LinuxBubblewrapSandbox {
             args.push(s);
         }
 
+        // Re-expose explicitly scoped per-agent writable paths (e.g., isolated agent home)
+        for rw in &opts.extra_writable_paths {
+            let real = fs::canonicalize(rw).unwrap_or_else(|_| rw.clone());
+            let s = real.to_string_lossy().to_string();
+            args.push("--bind".into());
+            args.push(s.clone());
+            args.push(s);
+        }
+
+        // Bind-mount ONLY the single gateway Unix domain socket while keeping --unshare-net
+        if let Some(ref sock) = opts.gateway_unix_socket {
+            let real = fs::canonicalize(sock).unwrap_or_else(|_| sock.clone());
+            let s = real.to_string_lossy().to_string();
+            args.push("--bind".into());
+            args.push(s.clone());
+            args.push(s);
+        }
+
         // Re-expose ONLY this run's isolated workspace read-write
         args.push("--bind".into());
         args.push(ws_s.clone());
@@ -285,13 +476,63 @@ impl LinuxBubblewrapSandbox {
         args.push("--chdir".into());
         args.push(ws_s);
 
-        if !opts.allow_network && opts.allowed_loopback_port.is_none() {
+        if !opts.allow_network {
             args.push("--unshare-net".into());
         }
 
         args.push("--".into());
         args.extend(cmd.iter().cloned());
-        args
+        Ok(args)
+    }
+
+    pub fn spawn_async(
+        &self,
+        cmd: &[String],
+        allowed_workspace: &Path,
+        opts: &SandboxRunOptions,
+    ) -> Result<SandboxedChild> {
+        let Some(ref bwrap) = self.bwrap_bin else {
+            bail!("Linux bubblewrap (bwrap) is unavailable on this host");
+        };
+        if cmd.is_empty() {
+            bail!("sandbox command cannot be empty");
+        }
+
+        let ws_real =
+            fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
+        let args = self.build_bwrap_args(cmd, &ws_real, opts)?;
+
+        let mut command = tokio::process::Command::new(bwrap);
+        command.args(&args);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        command.env_clear();
+        command.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+        command.env("HOME", &ws_real);
+        command.env("PYTHONDONTWRITEBYTECODE", "1");
+        for (k, v) in &opts.env_overrides {
+            command.env(k, v);
+        }
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn bwrap sandboxed process {:?}", cmd))?;
+        let pgid = child.id().map(|id| id as i32);
+        Ok(SandboxedChild {
+            child,
+            pgid,
+            _profile_guard: None,
+        })
     }
 
     pub fn run(
@@ -307,9 +548,9 @@ impl LinuxBubblewrapSandbox {
             bail!("sandbox command cannot be empty");
         }
 
-        let ws_real = fs::canonicalize(allowed_workspace)
-            .unwrap_or_else(|_| allowed_workspace.to_path_buf());
-        let args = self.build_bwrap_args(cmd, &ws_real, opts);
+        let ws_real =
+            fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
+        let args = self.build_bwrap_args(cmd, &ws_real, opts)?;
 
         let mut command = Command::new(bwrap);
         command.args(&args);
@@ -382,6 +623,18 @@ impl LocalOsSandbox {
         match self {
             Self::MacOS(s) => s.run(cmd, allowed_workspace, opts),
             Self::Linux(s) => s.run(cmd, allowed_workspace, opts),
+        }
+    }
+
+    pub fn spawn_async(
+        &self,
+        cmd: &[String],
+        allowed_workspace: &Path,
+        opts: &SandboxRunOptions,
+    ) -> Result<SandboxedChild> {
+        match self {
+            Self::MacOS(s) => s.spawn_async(cmd, allowed_workspace, opts),
+            Self::Linux(s) => s.spawn_async(cmd, allowed_workspace, opts),
         }
     }
 }
@@ -459,14 +712,17 @@ pub fn run_os_sandbox_verification_suite(base_dir: &Path) -> Result<SandboxVerif
 
     fs::write(secret_dir.join("host_canary.txt"), "HOST_SECRET_CANARY_999")?;
     fs::write(l0_ro.join("shared_lib.txt"), "SHARED_READONLY_L0_DATA")?;
-    fs::write(run1_ws.join("private_canary.txt"), "RUN1_PRIVATE_CANARY_ABC")?;
+    fs::write(
+        run1_ws.join("private_canary.txt"),
+        "RUN1_PRIVATE_CANARY_ABC",
+    )?;
     fs::write(run2_ws.join("task.txt"), "RUN2_ALLOWED_TASK_INPUT")?;
 
     let escape_link = run2_ws.join("symlink_to_secret.txt");
     #[cfg(unix)]
     std::os::unix::fs::symlink(secret_dir.join("host_canary.txt"), &escape_link)?;
 
-    let sb = LocalOsSandbox::new(&pool_root, &[secret_dir.clone()]);
+    let sb = LocalOsSandbox::new(&pool_root, std::slice::from_ref(&secret_dir));
     if !sb.is_available() {
         bail!("No supported OS sandbox binary available on this platform");
     }
@@ -599,7 +855,8 @@ pub fn run_os_sandbox_verification_suite(base_dir: &Path) -> Result<SandboxVerif
     checks.insert(
         "block_host_secret_read".into(),
         SandboxCheckOutcome {
-            passed: r_host_secret.kernel_denied && !r_host_secret.stdout.contains("HOST_SECRET_CANARY_999"),
+            passed: r_host_secret.kernel_denied
+                && !r_host_secret.stdout.contains("HOST_SECRET_CANARY_999"),
             elapsed_ms: None,
             stderr: Some(redact(&r_host_secret.stderr)),
         },
@@ -607,7 +864,8 @@ pub fn run_os_sandbox_verification_suite(base_dir: &Path) -> Result<SandboxVerif
     checks.insert(
         "block_prev_run_private_canary".into(),
         SandboxCheckOutcome {
-            passed: r_prev_canary.kernel_denied && !r_prev_canary.stdout.contains("RUN1_PRIVATE_CANARY_ABC"),
+            passed: r_prev_canary.kernel_denied
+                && !r_prev_canary.stdout.contains("RUN1_PRIVATE_CANARY_ABC"),
             elapsed_ms: None,
             stderr: Some(redact(&r_prev_canary.stderr)),
         },
@@ -691,22 +949,125 @@ mod tests {
         let pool = tmp.path().join("pool");
         let ws = pool.join("ws");
         let sec = tmp.path().join("sec");
+        let sock = tmp.path().join("gateway.sock");
         fs::create_dir_all(&ws).unwrap();
         fs::create_dir_all(&sec).unwrap();
+        fs::write(&sock, b"").unwrap();
 
         let sb = LinuxBubblewrapSandbox::new(&pool, &[sec]);
-        let args = sb.build_bwrap_args(
-            &["/bin/true".into()],
-            &ws,
-            &SandboxRunOptions {
-                allow_network: false,
-                allowed_loopback_port: None,
-                ..Default::default()
-            },
-        );
+        let args = sb
+            .build_bwrap_args(
+                &["/bin/true".into()],
+                &ws,
+                &SandboxRunOptions {
+                    allow_network: false,
+                    allowed_loopback_port: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(args.windows(3).any(|w| w == ["--ro-bind", "/", "/"]));
         assert!(args.contains(&"--unshare-net".to_string()));
         assert!(args.contains(&"--tmpfs".to_string()));
+
+        // FAIL CLOSED: allow_network=false + TCP loopback port without unix socket MUST error
+        let err = sb
+            .build_bwrap_args(
+                &["/bin/true".into()],
+                &ws,
+                &SandboxRunOptions {
+                    allow_network: false,
+                    allowed_loopback_port: Some(7310),
+                    gateway_unix_socket: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("FAIL_CLOSED"),
+            "unexpected error: {err}"
+        );
+
+        // Safe Linux gateway mode: Unix socket bound WHILE keeping --unshare-net enabled
+        let sock_args = sb
+            .build_bwrap_args(
+                &["/bin/true".into()],
+                &ws,
+                &SandboxRunOptions {
+                    allow_network: false,
+                    allowed_loopback_port: None,
+                    gateway_unix_socket: Some(sock.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let sock_real = fs::canonicalize(&sock)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(sock_args.contains(&"--unshare-net".to_string()));
+        assert!(
+            sock_args
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == sock_real && w[2] == sock_real),
+            "expected gateway unix socket bind mount in args: {sock_args:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_async_process_group_termination_reaps_grandchild() {
+        let tmp = TempDir::new().unwrap();
+        let pool = tmp.path().join("pool");
+        let ws = pool.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let sb = LocalOsSandbox::new(&pool, &[]);
+        if !sb.is_available() {
+            return;
+        }
+
+        let pid_file = ws.join("grandchild.pid");
+        let script = format!("sleep 60 & echo $! > \"{}\" ; wait", pid_file.display());
+        let mut child = sb
+            .spawn_async(
+                &["/bin/sh".into(), "-c".into(), script],
+                &ws,
+                &SandboxRunOptions::default(),
+            )
+            .unwrap();
+
+        // Wait until grandchild PID is written
+        let mut gpid: Option<i32> = None;
+        for _ in 0..50 {
+            if let Ok(raw) = fs::read_to_string(&pid_file) {
+                if let Ok(parsed) = raw.trim().parse::<i32>() {
+                    gpid = Some(parsed);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let gpid = gpid.expect("grandchild pid should be written");
+
+        let _status = child
+            .terminate_process_group(Duration::from_millis(300))
+            .await
+            .unwrap();
+
+        // Confirm grandchild is dead (ESRCH) on macOS where PID namespace is shared;
+        // on Linux bwrap --unshare-pid the PID inside the namespace is torn down with bwrap.
+        #[cfg(target_os = "macos")]
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let alive = unsafe { libc::kill(gpid, 0) == 0 };
+            assert!(
+                !alive,
+                "grandchild pid {gpid} survived process group termination"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = gpid;
+        }
     }
 
     #[test]
