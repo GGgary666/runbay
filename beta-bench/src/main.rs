@@ -1,12 +1,5 @@
 use anyhow::Result;
 use chrono::Utc;
-use serde::Deserialize;
-use std::collections::{BTreeMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::thread;
-use std::time::Instant;
 use runbay_gateway::{MockUpstreamServer, SecretlessLoopbackGateway};
 use runbay_mvcc::{
     copy_dir_recursive, cow_clone_tree, DerivedWorkspaceIndexLayer, L0ContentAddressedStore,
@@ -19,6 +12,13 @@ use runbay_scheduler::{
     generate_rate_limited_workload, simulate_scheduler_policy, CancelToken, GuardedRunSink,
     PolicyName,
 };
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
+use std::time::Instant;
 use tempfile::TempDir;
 
 #[allow(dead_code)]
@@ -89,7 +89,9 @@ async fn run_correctness_oracle(work_dir: &Path) -> Result<serde_json::Value> {
     // 1. Real OS sandbox isolation (macOS Seatbelt or Linux bubblewrap)
     let probe_sb = LocalOsSandbox::new(work_dir, &[]);
     let sb_report = if probe_sb.is_available() {
-        serde_json::to_value(run_os_sandbox_verification_suite(&work_dir.join("os_sandbox"))?)?
+        serde_json::to_value(run_os_sandbox_verification_suite(
+            &work_dir.join("os_sandbox"),
+        )?)?
     } else {
         serde_json::json!({
             "measurement_type": "real_os_kernel_exec",
@@ -97,7 +99,9 @@ async fn run_correctness_oracle(work_dir: &Path) -> Result<serde_json::Value> {
             "note": "No supported OS sandbox binary (sandbox-exec / bwrap) found on this host"
         })
     };
-    let sb_ok = sb_report["all_invariants_passed"].as_bool().unwrap_or(false);
+    let sb_ok = sb_report["all_invariants_passed"]
+        .as_bool()
+        .unwrap_or(false);
 
     // 2. Poisoned worker quarantine
     let quarantine = QuarantineRegistry::new();
@@ -163,7 +167,8 @@ async fn run_correctness_oracle(work_dir: &Path) -> Result<serde_json::Value> {
     let gw_e2e = run_seatbelt_gateway_e2e(&work_dir.join("gw_e2e")).await?;
     let gw_ok = gw_e2e["verified"].as_bool().unwrap_or(false);
 
-    let all_passed = sb_ok && quarantine_ok && mvcc_ok && eq_report.exact_equivalence && cancel_ok && gw_ok;
+    let all_passed =
+        sb_ok && quarantine_ok && mvcc_ok && eq_report.exact_equivalence && cancel_ok && gw_ok;
 
     Ok(serde_json::json!({
         "measurement_type": "real_os_kernel_exec",
@@ -204,9 +209,12 @@ async fn run_seatbelt_gateway_e2e(work_dir: &Path) -> Result<serde_json::Value> 
     let secrets = work_dir.join("secrets");
     fs::create_dir_all(&ws)?;
     fs::create_dir_all(&secrets)?;
-    fs::write(secrets.join(".env"), "API_KEY=host-only-secret-key-never-in-sandbox\n")?;
+    fs::write(
+        secrets.join(".env"),
+        "API_KEY=host-only-secret-key-never-in-sandbox\n",
+    )?;
 
-    let sb = LocalOsSandbox::new(&pool, &[secrets.clone()]);
+    let sb = LocalOsSandbox::new(&pool, std::slice::from_ref(&secrets));
     if !sb.is_available() {
         let tok = gw.mint_run_token("fallback-e2e", Some("beta-model".into()));
         let resp = reqwest::Client::new()
@@ -225,36 +233,59 @@ async fn run_seatbelt_gateway_e2e(work_dir: &Path) -> Result<serde_json::Value> 
     let tok = gw.mint_run_token("sandbox-e2e", Some("beta-model".into()));
     let mut env_overrides = BTreeMap::new();
     env_overrides.insert("RUNBAY_RUN_TOKEN".into(), tok);
-    env_overrides.insert("RUNBAY_GATEWAY_URL".into(), gw.base_url());
 
-    let net_check = if cfg!(target_os = "macos") {
-        "if curl -sS --max-time 1 https://1.1.1.1 >/dev/null 2>&1; then echo NET_LEAKED; exit 3; fi; "
-    } else {
-        ""
-    };
-    let script = format!(
-        "if cat \"{}/.env\" >/dev/null 2>&1; then echo ENV_LEAKED; exit 2; fi; \
-         {net_check}\
-         curl -sS --max-time 5 -X POST \"$RUNBAY_GATEWAY_URL/chat/completions\" \
-           -H \"Authorization: Bearer $RUNBAY_RUN_TOKEN\" \
-           -H \"Content-Type: application/json\" \
-           -d '{{\"model\":\"beta-model\",\"stream\":false}}'",
-        secrets.display()
-    );
-
-    let gw_port = gw.port();
-    let ws_clone = ws.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        sb.run(
-            &["/bin/sh".into(), "-c".into(), script],
-            &ws_clone,
-            &SandboxRunOptions {
+    let (opts, curl_call, gateway_transport) = if cfg!(target_os = "macos") {
+        env_overrides.insert("RUNBAY_GATEWAY_URL".into(), gw.base_url());
+        (
+            SandboxRunOptions {
                 allow_network: false,
-                allowed_loopback_port: Some(gw_port),
+                allowed_loopback_port: Some(gw.port()),
                 env_overrides,
                 ..Default::default()
             },
+            "curl -sS --max-time 5 -X POST \"$RUNBAY_GATEWAY_URL/chat/completions\" \
+               -H \"Authorization: Bearer $RUNBAY_RUN_TOKEN\" \
+               -H \"Content-Type: application/json\" \
+               -d '{\"model\":\"beta-model\",\"stream\":false}'"
+                .to_string(),
+            "macos_seatbelt_loopback_tcp",
         )
+    } else {
+        let sock_path = gw
+            .bind_unix_socket(work_dir.join("gw_sock/gateway.sock"))
+            .await?;
+        env_overrides.insert(
+            "RUNBAY_GATEWAY_SOCKET".into(),
+            sock_path.to_string_lossy().to_string(),
+        );
+        (
+            SandboxRunOptions {
+                allow_network: false,
+                allowed_loopback_port: None,
+                gateway_unix_socket: Some(sock_path),
+                env_overrides,
+                ..Default::default()
+            },
+            "curl -sS --max-time 5 --unix-socket \"$RUNBAY_GATEWAY_SOCKET\" \
+               -X POST \"http://localhost/v1/chat/completions\" \
+               -H \"Authorization: Bearer $RUNBAY_RUN_TOKEN\" \
+               -H \"Content-Type: application/json\" \
+               -d '{\"model\":\"beta-model\",\"stream\":false}'"
+                .to_string(),
+            "linux_bwrap_unshare_net_unix_socket",
+        )
+    };
+
+    let script = format!(
+        "if cat \"{}/.env\" >/dev/null 2>&1; then echo ENV_LEAKED; exit 2; fi; \
+         if curl -sS --max-time 1 https://1.1.1.1 >/dev/null 2>&1; then echo NET_LEAKED; exit 3; fi; \
+         {curl_call}",
+        secrets.display()
+    );
+
+    let ws_clone = ws.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        sb.run(&["/bin/sh".into(), "-c".into(), script], &ws_clone, &opts)
     })
     .await??;
 
@@ -266,8 +297,10 @@ async fn run_seatbelt_gateway_e2e(work_dir: &Path) -> Result<serde_json::Value> 
         "verified": verified,
         "returncode": res.returncode,
         "elapsed_ms": res.elapsed_ms,
+        "gateway_transport": gateway_transport,
         "sandbox_checks": {
             "env_file_blocked": verified,
+            "direct_internet_check_executed": true,
             "direct_internet_blocked": verified,
             "real_key_in_sandbox_env": false,
             "loopback_gateway_ok": verified
@@ -437,7 +470,8 @@ fn run_concurrent_mvcc_throughput(work_dir: &Path) -> Result<serde_json::Value> 
                         anyhow::bail!("unexpected empty result for rev={rev} q={q}");
                     }
                     if rev == 0 && i % 10 == 0 {
-                        let iso = p.query_at_revision_uncached(0, "CONCURRENT_REV1_ONLY_MARKER", 3)?;
+                        let iso =
+                            p.query_at_revision_uncached(0, "CONCURRENT_REV1_ONLY_MARKER", 3)?;
                         if !iso.hits.is_empty() {
                             anyhow::bail!("MVCC isolation violation: rev=0 saw rev=1 marker");
                         }
@@ -475,7 +509,10 @@ fn run_concurrent_mvcc_throughput(work_dir: &Path) -> Result<serde_json::Value> 
     }))
 }
 
-fn run_trace_replay_benchmarks(work_dir: &Path, traces: &[RecordedTrace]) -> Result<serde_json::Value> {
+fn run_trace_replay_benchmarks(
+    work_dir: &Path,
+    traces: &[RecordedTrace],
+) -> Result<serde_json::Value> {
     let src = work_dir.join("replay_src");
     build_synthetic_repo(&src, 120)?;
     let store = MVCCWorkspaceStore::new(work_dir.join("replay_store"), &src)?;
@@ -503,12 +540,16 @@ fn run_trace_replay_benchmarks(work_dir: &Path, traces: &[RecordedTrace]) -> Res
         let mut up = BTreeMap::new();
         up.insert(
             format!("docs/service_{:04}.md", idx % 10),
-            format!("# Service {idx}\n\nSpecBox prewarm delta rev {}.\n", idx + 1),
+            format!(
+                "# Service {idx}\n\nSpecBox prewarm delta rev {}.\n",
+                idx + 1
+            ),
         );
         let new_snap = store.commit_delta(&up, &[], None)?;
 
         let t0 = Instant::now();
-        let (branches, _) = store.fork_branch_group(&format!("specbox-{idx}"), 1, Some(new_snap.rev))?;
+        let (branches, _) =
+            store.fork_branch_group(&format!("specbox-{idx}"), 1, Some(new_snap.rev))?;
         let _ = proxy.sync_to_revision(new_snap.rev)?;
         let real_prep_ms = round_n(t0.elapsed().as_secs_f64() * 1000.0, 3);
         store.abort_branch(&branches[0].branch_id, "prewarm_bench_cleanup");
@@ -620,7 +661,10 @@ fn run_trace_replay_benchmarks(work_dir: &Path, traces: &[RecordedTrace]) -> Res
     let early_p95 = round_n(percentile(&early_jcts, 0.95), 2);
 
     // 3. Honest Churn Saturation Analysis (12 RPS & 80 RPS across 10% / 30% / 50% churn)
-    let mean_llm_ms = round_n(llm_durs.iter().sum::<f64>() / llm_durs.len().max(1) as f64, 2);
+    let mean_llm_ms = round_n(
+        llm_durs.iter().sum::<f64>() / llm_durs.len().max(1) as f64,
+        2,
+    );
     let cold_rebuild_ms = proxy.initial_build_ms;
     let inc_ms = mean_prep.max(0.5);
     let mut churn_rows = Vec::new();
@@ -642,8 +686,20 @@ fn run_trace_replay_benchmarks(work_dir: &Path, traces: &[RecordedTrace]) -> Res
                     let drifted = ((i as f64 * 0.6180339887) % 1.0) < churn;
                     let prep = match mode {
                         "always_new" => prep_fn,
-                        "full_rebuild_on_change" => if drifted { prep_fn } else { 0.4 },
-                        _ => if drifted { prep_fn } else { 0.2 },
+                        "full_rebuild_on_change" => {
+                            if drifted {
+                                prep_fn
+                            } else {
+                                0.4
+                            }
+                        }
+                        _ => {
+                            if drifted {
+                                prep_fn
+                            } else {
+                                0.2
+                            }
+                        }
                     };
                     let s_idx = if slot_free[0] <= slot_free[1] { 0 } else { 1 };
                     let start = arr.max(slot_free[s_idx]);
@@ -713,7 +769,8 @@ fn run_trace_replay_benchmarks(work_dir: &Path, traces: &[RecordedTrace]) -> Res
 }
 
 fn run_scheduler_benchmarks(traces: &[RecordedTrace]) -> serde_json::Value {
-    let mean_ttft_s = traces.iter().map(|t| t.ttft_ms).sum::<f64>() / traces.len().max(1) as f64 / 1000.0;
+    let mean_ttft_s =
+        traces.iter().map(|t| t.ttft_ms).sum::<f64>() / traces.len().max(1) as f64 / 1000.0;
     let mean_decode_s = traces
         .iter()
         .map(|t| (t.total_llm_ms - t.ttft_ms).max(100.0))
@@ -733,7 +790,10 @@ fn run_scheduler_benchmarks(traces: &[RecordedTrace]) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         for p in policies {
             let report = simulate_scheduler_policy(&jobs, p, 3, 12.0, 35.0, 40_000);
-            map.insert(p.as_str().to_string(), serde_json::to_value(report).unwrap());
+            map.insert(
+                p.as_str().to_string(),
+                serde_json::to_value(report).unwrap(),
+            );
         }
         serde_json::Value::Object(map)
     };
@@ -749,6 +809,162 @@ fn run_scheduler_benchmarks(traces: &[RecordedTrace]) -> serde_json::Value {
     })
 }
 
+async fn run_daemon_http_check(
+    work_dir: &Path,
+    runbayd_bin: Option<&Path>,
+) -> Result<serde_json::Value> {
+    let bin = runbayd_bin
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("runbayd")))
+        })
+        .filter(|p| p.is_file());
+
+    let Some(bin) = bin else {
+        return Ok(serde_json::json!({
+            "measurement_type": "real_daemon_http_e2e",
+            "executed": false,
+            "passed": false,
+            "reason": "runbayd binary not found; pass --runbayd-bin <path> or build runbayd first"
+        }));
+    };
+
+    let state_dir = work_dir.join("daemon_state");
+    let ws_dir = work_dir.join("daemon_ws");
+    fs::create_dir_all(&ws_dir)?;
+    fs::write(ws_dir.join("README.md"), "# Daemon HTTP Check\n")?;
+
+    let mock = MockUpstreamServer::start().await?;
+    let token = "rb_ctl_beta_bench_http";
+    let t0 = Instant::now();
+
+    let mut child = std::process::Command::new(&bin)
+        .args([
+            "serve",
+            "--port",
+            "0",
+            "--state-dir",
+            &state_dir.to_string_lossy(),
+            "--token",
+            token,
+            "--allow-workspace-root",
+            &ws_dir.to_string_lossy(),
+            "--upstream-url",
+            &mock.base_url(),
+            "--enable-fixture-adapter",
+        ])
+        .env("RUNBAY_UPSTREAM_API_KEY", "bench-host-key-never-in-sandbox")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("runbayd stdout unavailable"))?;
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut ready_line = String::new();
+    use std::io::BufRead;
+    let _ = reader.read_line(&mut ready_line)?;
+    let addr = ready_line
+        .trim()
+        .strip_prefix("RUNBAYD_READY ")
+        .and_then(|rest| serde_json::from_str::<serde_json::Value>(rest).ok())
+        .and_then(|v| v["addr"].as_str().map(str::to_string))
+        .ok_or_else(|| anyhow::anyhow!("runbayd failed to emit RUNBAYD_READY: {ready_line}"))?;
+
+    let base_url = format!("http://{addr}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let reg = client
+        .post(format!("{base_url}/agents"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({
+            "agent_id": "bench-http-agent",
+            "runtime": "fixture",
+            "workspace_dir": ws_dir.to_string_lossy()
+        }))
+        .send()
+        .await?;
+    let reg_ok = reg.status().as_u16() == 201;
+
+    let prompt = serde_json::json!({
+        "action": "call_gateway",
+        "model": "bench-model",
+        "check_direct_net": true
+    })
+    .to_string();
+    let sub = client
+        .post(format!("{base_url}/agents/bench-http-agent/run"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({"prompt": prompt, "allowed_model": "bench-model"}))
+        .send()
+        .await?;
+    let sub_ok = sub.status().as_u16() == 202;
+    let run_id = sub.json::<serde_json::Value>().await?["run_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let sse_text = client
+        .get(format!("{base_url}/runs/{run_id}/events"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?
+        .text()
+        .await?;
+
+    let run_json: serde_json::Value = client
+        .get(format!("{base_url}/runs/{run_id}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let del = client
+        .delete(format!("{base_url}/agents/bench-http-agent"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    let del_ok = del.status().as_u16() == 200;
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let elapsed_ms = round_n(t0.elapsed().as_secs_f64() * 1000.0, 2);
+    let passed = reg_ok
+        && sub_ok
+        && del_ok
+        && run_json["state"] == "succeeded"
+        && run_json["sandbox_enforced"] == true
+        && run_json["network_isolated"] == true
+        && run_json["secretless_gateway"] == true
+        && sse_text.contains("event: run.succeeded")
+        && sse_text.contains("fixture.gateway_ok")
+        && !sse_text.contains("bench-host-key-never-in-sandbox")
+        && mock
+            .seen_auth_headers()
+            .iter()
+            .any(|h| h == "Bearer bench-host-key-never-in-sandbox");
+
+    Ok(serde_json::json!({
+        "measurement_type": "real_daemon_http_e2e",
+        "executed": true,
+        "passed": passed,
+        "elapsed_ms": elapsed_ms,
+        "sandbox_enforced": run_json["sandbox_enforced"],
+        "network_isolated": run_json["network_isolated"],
+        "secretless_gateway": run_json["secretless_gateway"],
+        "gateway_transport": run_json["gateway_transport"]
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -762,6 +978,10 @@ async fn main() -> Result<()> {
         .find(|w| w[0] == "--out")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(|| PathBuf::from("beta-bench/artifacts/beta_bench_results.json"));
+    let runbayd_bin = args
+        .windows(2)
+        .find(|w| w[0] == "--runbayd-bin")
+        .map(|w| PathBuf::from(&w[1]));
 
     let t_total = Instant::now();
     let traces_raw = fs::read_to_string(&traces_path)?;
@@ -769,6 +989,8 @@ async fn main() -> Result<()> {
 
     let tmp = TempDir::new()?;
     let oracle = run_correctness_oracle(&tmp.path().join("oracle")).await?;
+    let daemon_http =
+        run_daemon_http_check(&tmp.path().join("daemon_http"), runbayd_bin.as_deref()).await?;
     let scaling = run_l0_l1_l2_scaling(&tmp.path().join("scaling"))?;
     let concurrency = run_concurrent_mvcc_throughput(&tmp.path().join("concurrency"))?;
     let replay = run_trace_replay_benchmarks(&tmp.path().join("replay"), &traces)?;
@@ -777,6 +999,7 @@ async fn main() -> Result<()> {
     let full_report = serde_json::json!({
         "suite": "runbay-beta-bench",
         "implementation": "rust",
+        "daemon_http_execution": daemon_http,
         "generated_at_utc": Utc::now().to_rfc3339(),
         "total_bench_wall_ms": round_n(t_total.elapsed().as_secs_f64() * 1000.0, 2),
         "correctness_oracle": oracle,

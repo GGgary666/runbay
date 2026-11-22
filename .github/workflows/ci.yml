@@ -18,6 +18,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Install Linux sandbox tooling (bubblewrap)
         if: runner.os == 'Linux'
@@ -28,15 +30,31 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
-      - name: Run full workspace unit & OS kernel integration tests
-        run: cargo test --workspace -- --nocapture
+      - name: Check formatting and Clippy lints
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run full workspace unit, OS sandbox, and black-box daemon E2E tests
+        run: cargo test --workspace --locked -- --nocapture
 
       - name: Run runbayd self-check
-        run: cargo run -p runbayd -- self-check
+        run: cargo run -p runbayd --locked -- self-check
 
-      - name: Run beta-bench release suite
+      - name: Build release daemon & run beta-bench with HTTP daemon execution check
         run: |
-          cargo run -p runbay-beta-bench --release -- \
+          cargo build -p runbayd -p runbay-beta-bench --release --locked
+          target/release/beta-bench \
+            --runbayd-bin target/release/runbayd \
             --traces beta-bench/fixtures/recorded_llm_traces.json \
             --out /tmp/beta_bench_ci_results.json
-          python3 -c 'import json; d=json.load(open("/tmp/beta_bench_ci_results.json")); assert d["correctness_oracle"]["all_invariants_passed"] is True, d["correctness_oracle"]'
+          python3 -c '
+          import json
+          d = json.load(open("/tmp/beta_bench_ci_results.json"))
+          assert d["correctness_oracle"]["all_invariants_passed"] is True, d["correctness_oracle"]
+          gw_checks = d["correctness_oracle"]["6_secretless_gateway_seatbelt_e2e"]["sandbox_checks"]
+          assert gw_checks["direct_internet_check_executed"] is True, gw_checks
+          assert gw_checks["direct_internet_blocked"] is True, gw_checks
+          assert d["daemon_http_execution"]["executed"] is True, d["daemon_http_execution"]
+          assert d["daemon_http_execution"]["passed"] is True, d["daemon_http_execution"]
+          '

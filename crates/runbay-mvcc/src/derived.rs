@@ -311,18 +311,18 @@ pub fn split_markdown_blocks(rel_path: &str, content: &str) -> Vec<(String, Stri
                 if body.is_empty() {
                     continue;
                 }
-                blocks.push((format!("{rel_path}::{idx}"), cur_h.clone(), body.to_string()));
+                blocks.push((
+                    format!("{rel_path}::{idx}"),
+                    cur_h.clone(),
+                    body.to_string(),
+                ));
                 idx += 1;
             }
         }
     }
 
     if blocks.is_empty() && !content.trim().is_empty() {
-        blocks.push((
-            format!("{rel_path}::0"),
-            cur_h,
-            content.trim().to_string(),
-        ));
+        blocks.push((format!("{rel_path}::0"), cur_h, content.trim().to_string()));
     }
     blocks
 }
@@ -594,7 +594,8 @@ impl DerivedWorkspaceIndexLayer {
                 "INSERT INTO blocks_fts(block_id, rel_path, heading, body) VALUES (?1, ?2, ?3, ?4)",
             )?;
             for (bid, rel, h, body) in &all_blocks {
-                let vec_json = serde_json::to_string(&self.encoder.encode(&format!("{h}\n{body}")))?;
+                let vec_json =
+                    serde_json::to_string(&self.encoder.encode(&format!("{h}\n{body}")))?;
                 ins_block.execute(params![bid, rel, h, body, vec_json])?;
                 ins_fts.execute(params![bid, rel, h, body])?;
             }

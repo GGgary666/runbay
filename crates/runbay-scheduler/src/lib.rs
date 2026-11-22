@@ -428,8 +428,7 @@ pub fn simulate_scheduler_policy(
             job.base_ttft_miss_s
         };
         let llm_s = ttft_s + job.decode_s;
-        let cost_units =
-            (job.prefix_tokens as f64 * if cache_hit { 0.10 } else { 1.15 }) / 1000.0;
+        let cost_units = (job.prefix_tokens as f64 * if cache_hit { 0.10 } else { 1.15 }) / 1000.0;
         let finish_s = llm_start_s + llm_s + job.tool_s;
 
         workers[w_idx].free_at = finish_s;

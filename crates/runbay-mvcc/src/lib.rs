@@ -34,7 +34,10 @@ mod tests {
         for i in 0..8 {
             fs::write(
                 root.join(format!("notes/doc_{i}.md")),
-                format!("# Service {i}\n\nLatency budget is {}ms with retry token tok_{i}.\n", 100 + i * 10),
+                format!(
+                    "# Service {i}\n\nLatency budget is {}ms with retry token tok_{i}.\n",
+                    100 + i * 10
+                ),
             )
             .unwrap();
         }
@@ -77,7 +80,13 @@ mod tests {
         build_sample_workspace(&src);
 
         let store = MVCCWorkspaceStore::new(tmp.path().join("mvcc"), &src).unwrap();
-        let proxy = SharedOutOfSandboxDerivedProxy::new(tmp.path().join("proxy"), Arc::clone(&store), 32, 256).unwrap();
+        let proxy = SharedOutOfSandboxDerivedProxy::new(
+            tmp.path().join("proxy"),
+            Arc::clone(&store),
+            32,
+            256,
+        )
+        .unwrap();
 
         // Pin rev=0 while active_rev == 0
         let lease0 = store.pin_snapshot(Some(0)).unwrap();
@@ -96,19 +105,31 @@ mod tests {
         store.commit_delta(&up1, &[], Some(0)).unwrap();
 
         let del2 = vec!["notes/doc_1.md".to_string()];
-        store.commit_delta(&BTreeMap::new(), &del2, Some(1)).unwrap();
+        store
+            .commit_delta(&BTreeMap::new(), &del2, Some(1))
+            .unwrap();
 
         // Advance active_rev to 2 first (triggers WAL backup of rev=0!)
-        let q2_new = proxy.query_at_revision(2, "REV1_ONLY_BRAND_NEW_SECRET", 5).unwrap();
+        let q2_new = proxy
+            .query_at_revision(2, "REV1_ONLY_BRAND_NEW_SECRET", 5)
+            .unwrap();
         assert!(!q2_new.hits.is_empty());
         let q2_del = proxy.query_at_revision(2, "tok_1", 5).unwrap();
         assert!(q2_del.hits.is_empty());
 
         // Now pinned rev=0 reader MUST still see doc_1 (non-empty WAL backup!) and MUST NOT see rev=1/2 mutations
         let q0_old = proxy.query_at_revision(0, "tok_1", 5).unwrap();
-        assert!(!q0_old.hits.is_empty(), "rev=0 WAL snapshot must not be empty");
-        let q0_future = proxy.query_at_revision(0, "REV1_ONLY_BRAND_NEW_SECRET", 5).unwrap();
-        assert!(q0_future.hits.is_empty(), "rev=0 must never read rev=1 future doc");
+        assert!(
+            !q0_old.hits.is_empty(),
+            "rev=0 WAL snapshot must not be empty"
+        );
+        let q0_future = proxy
+            .query_at_revision(0, "REV1_ONLY_BRAND_NEW_SECRET", 5)
+            .unwrap();
+        assert!(
+            q0_future.hits.is_empty(),
+            "rev=0 must never read rev=1 future doc"
+        );
 
         drop(lease0);
         assert_eq!(store.active_leases_for(0), 0);
@@ -122,8 +143,13 @@ mod tests {
 
         let store = MVCCWorkspaceStore::new(tmp.path().join("mvcc"), &src).unwrap();
         let proxy = Arc::new(
-            SharedOutOfSandboxDerivedProxy::new(tmp.path().join("proxy"), Arc::clone(&store), 32, 256)
-                .unwrap(),
+            SharedOutOfSandboxDerivedProxy::new(
+                tmp.path().join("proxy"),
+                Arc::clone(&store),
+                32,
+                256,
+            )
+            .unwrap(),
         );
         let lease0 = store.pin_snapshot(Some(0)).unwrap();
 
@@ -138,7 +164,9 @@ mod tests {
                     let q = format!("tok_{}", (tid + iter) % 8);
                     let res = p.query_at_revision_uncached(0, &q, 3).unwrap();
                     assert!(!res.hits.is_empty());
-                    let fut = p.query_at_revision_uncached(0, "CONCURRENT_FUTURE_TOKEN", 3).unwrap();
+                    let fut = p
+                        .query_at_revision_uncached(0, "CONCURRENT_FUTURE_TOKEN", 3)
+                        .unwrap();
                     assert!(fut.hits.is_empty());
                 }
             }));
@@ -176,9 +204,15 @@ mod tests {
         let sib2_cancelled = Arc::new(AtomicBool::new(false));
         {
             let f1 = Arc::clone(&sib1_cancelled);
-            store.register_branch_cancel_hook(&branches[1].branch_id, Arc::new(move || f1.store(true, Ordering::SeqCst)));
+            store.register_branch_cancel_hook(
+                &branches[1].branch_id,
+                Arc::new(move || f1.store(true, Ordering::SeqCst)),
+            );
             let f2 = Arc::clone(&sib2_cancelled);
-            store.register_branch_cancel_hook(&branches[2].branch_id, Arc::new(move || f2.store(true, Ordering::SeqCst)));
+            store.register_branch_cancel_hook(
+                &branches[2].branch_id,
+                Arc::new(move || f2.store(true, Ordering::SeqCst)),
+            );
         }
 
         fs::write(
@@ -195,8 +229,14 @@ mod tests {
         assert_eq!(out.aborted_siblings.len(), 2);
         assert!(sib1_cancelled.load(Ordering::SeqCst));
         assert!(sib2_cancelled.load(Ordering::SeqCst));
-        assert_eq!(store.branch_status(&branches[0].branch_id), Some(BranchStatus::Committed));
-        assert_eq!(store.branch_status(&branches[1].branch_id), Some(BranchStatus::Aborted));
+        assert_eq!(
+            store.branch_status(&branches[0].branch_id),
+            Some(BranchStatus::Committed)
+        );
+        assert_eq!(
+            store.branch_status(&branches[1].branch_id),
+            Some(BranchStatus::Aborted)
+        );
 
         // Second commit on already-aborted sibling fails cleanly
         let out2 = store
@@ -212,7 +252,13 @@ mod tests {
         build_sample_workspace(&src);
 
         let store = MVCCWorkspaceStore::new(tmp.path().join("mvcc"), &src).unwrap();
-        let proxy = SharedOutOfSandboxDerivedProxy::new(tmp.path().join("proxy"), Arc::clone(&store), 32, 256).unwrap();
+        let proxy = SharedOutOfSandboxDerivedProxy::new(
+            tmp.path().join("proxy"),
+            Arc::clone(&store),
+            32,
+            256,
+        )
+        .unwrap();
 
         let mut up = BTreeMap::new();
         up.insert(
@@ -228,7 +274,12 @@ mod tests {
             .unwrap();
 
         let eq = proxy
-            .verify_incremental_equals_full_rebuild(&["latency budget", "tok_0", "shard router", "tok_2"])
+            .verify_incremental_equals_full_rebuild(&[
+                "latency budget",
+                "tok_0",
+                "shard router",
+                "tok_2",
+            ])
             .unwrap();
         assert!(eq.file_hashes_bit_identical);
         assert!(eq.blocks_table_bit_identical);
@@ -270,7 +321,9 @@ mod tests {
         let proxy_a =
             SharedOutOfSandboxDerivedProxy::new(&shared_proxy_dir, Arc::clone(&store_a), 32, 256)
                 .unwrap();
-        let hits_a = proxy_a.query_at_revision_uncached(0, "oldmarker", 5).unwrap();
+        let hits_a = proxy_a
+            .query_at_revision_uncached(0, "oldmarker", 5)
+            .unwrap();
         assert_eq!(hits_a.hits.len(), 1);
         drop(proxy_a);
         drop(store_a);
@@ -283,10 +336,21 @@ mod tests {
         let proxy_b =
             SharedOutOfSandboxDerivedProxy::new(&shared_proxy_dir, Arc::clone(&store_b), 32, 256)
                 .unwrap();
-        let hits_old = proxy_b.query_at_revision_uncached(0, "oldmarker", 5).unwrap();
-        let hits_new = proxy_b.query_at_revision_uncached(0, "newmarker", 5).unwrap();
-        assert!(hits_old.hits.is_empty(), "reused proxy_dir leaked stale Store A DB");
-        assert_eq!(hits_new.hits.len(), 1, "reused proxy_dir failed to read Store B DB");
+        let hits_old = proxy_b
+            .query_at_revision_uncached(0, "oldmarker", 5)
+            .unwrap();
+        let hits_new = proxy_b
+            .query_at_revision_uncached(0, "newmarker", 5)
+            .unwrap();
+        assert!(
+            hits_old.hits.is_empty(),
+            "reused proxy_dir leaked stale Store A DB"
+        );
+        assert_eq!(
+            hits_new.hits.len(),
+            1,
+            "reused proxy_dir failed to read Store B DB"
+        );
     }
 
     #[test]
@@ -318,12 +382,19 @@ mod tests {
         let src = tmp.path().join("src");
         build_sample_workspace(&src);
         let store = MVCCWorkspaceStore::new(tmp.path().join("mvcc"), &src).unwrap();
-        let proxy =
-            SharedOutOfSandboxDerivedProxy::new(tmp.path().join("proxy"), Arc::clone(&store), 32, 256)
-                .unwrap();
+        let proxy = SharedOutOfSandboxDerivedProxy::new(
+            tmp.path().join("proxy"),
+            Arc::clone(&store),
+            32,
+            256,
+        )
+        .unwrap();
 
         let mut up = BTreeMap::new();
-        up.insert(".hidden.md".to_string(), "# Hidden\n\nSECRET_HIDDEN_TOK.\n".to_string());
+        up.insert(
+            ".hidden.md".to_string(),
+            "# Hidden\n\nSECRET_HIDDEN_TOK.\n".to_string(),
+        );
         up.insert("config.txt".to_string(), "PLAIN_CONFIG_TOK=1\n".to_string());
         up.insert(
             "./notes/doc_0.md".to_string(),
@@ -334,10 +405,21 @@ mod tests {
         let h_hidden = proxy.query_at_revision(1, "SECRET_HIDDEN_TOK", 5).unwrap();
         let h_txt = proxy.query_at_revision(1, "PLAIN_CONFIG_TOK", 5).unwrap();
         let h_old = proxy.query_at_revision(1, "tok_0", 5).unwrap();
-        let h_new = proxy.query_at_revision(1, "CANONICAL_REPLACED_TOK", 5).unwrap();
-        assert!(h_hidden.hits.is_empty(), "hidden .md must not be indexed incrementally");
-        assert!(h_txt.hits.is_empty(), "non-markdown .txt must not be indexed incrementally");
-        assert!(h_old.hits.is_empty(), "./notes/doc_0.md must replace notes/doc_0.md cleanly");
+        let h_new = proxy
+            .query_at_revision(1, "CANONICAL_REPLACED_TOK", 5)
+            .unwrap();
+        assert!(
+            h_hidden.hits.is_empty(),
+            "hidden .md must not be indexed incrementally"
+        );
+        assert!(
+            h_txt.hits.is_empty(),
+            "non-markdown .txt must not be indexed incrementally"
+        );
+        assert!(
+            h_old.hits.is_empty(),
+            "./notes/doc_0.md must replace notes/doc_0.md cleanly"
+        );
         assert_eq!(h_new.hits.len(), 1);
         assert_eq!(h_new.hits[0].rel_path, "notes/doc_0.md");
 
@@ -356,35 +438,37 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("a.md"), "# Seed\n\nseedword common baseline alpha.\n").unwrap();
+        fs::write(
+            src.join("a.md"),
+            "# Seed\n\nseedword common baseline alpha.\n",
+        )
+        .unwrap();
 
         let store = MVCCWorkspaceStore::new(tmp.path().join("mvcc"), &src).unwrap();
         let mut up1 = BTreeMap::new();
-        up1.insert("b.md".to_string(), "# Late\n\nlateword common delta beta.\n".to_string());
+        up1.insert(
+            "b.md".to_string(),
+            "# Late\n\nlateword common delta beta.\n".to_string(),
+        );
         store.commit_delta(&up1, &[], Some(0)).unwrap();
         let mut up2 = BTreeMap::new();
-        up2.insert("c.md".to_string(), "# Later\n\nlaterword common gamma.\n".to_string());
+        up2.insert(
+            "c.md".to_string(),
+            "# Later\n\nlaterword common gamma.\n".to_string(),
+        );
         store.commit_delta(&up2, &[], Some(1)).unwrap();
 
         // Proxy 1: queries rev=1 first (incremental path), then rev=2
-        let p1 = SharedOutOfSandboxDerivedProxy::new(
-            tmp.path().join("p1"),
-            Arc::clone(&store),
-            32,
-            256,
-        )
-        .unwrap();
+        let p1 =
+            SharedOutOfSandboxDerivedProxy::new(tmp.path().join("p1"), Arc::clone(&store), 32, 256)
+                .unwrap();
         let r1_warm = p1.query_at_revision(1, "lateword common", 5).unwrap();
         let _ = p1.query_at_revision(2, "laterword", 5).unwrap();
 
         // Proxy 2: jumps directly to rev=2 first, then queries cold historical rev=1
-        let p2 = SharedOutOfSandboxDerivedProxy::new(
-            tmp.path().join("p2"),
-            Arc::clone(&store),
-            32,
-            256,
-        )
-        .unwrap();
+        let p2 =
+            SharedOutOfSandboxDerivedProxy::new(tmp.path().join("p2"), Arc::clone(&store), 32, 256)
+                .unwrap();
         let _ = p2.query_at_revision(2, "laterword", 5).unwrap();
         let r1_cold = p2.query_at_revision(1, "lateword common", 5).unwrap();
 

@@ -1,34 +1,33 @@
-use anyhow::Result;
-use bytes::Bytes;
-use http::{Request, Response, StatusCode};
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
-use std::collections::BTreeMap;
-use std::convert::Infallible;
-use std::fs;
-use std::sync::Arc;
+mod adapters;
+mod auth;
+mod fixture_worker;
+mod models;
+mod server;
+mod store;
+mod supervisor;
+
+use anyhow::{bail, Result};
+use auth::generate_csprng_token;
 use runbay_gateway::{MockUpstreamServer, SecretlessLoopbackGateway};
 use runbay_mvcc::{MVCCWorkspaceStore, SharedOutOfSandboxDerivedProxy};
 use runbay_sandbox::{run_os_sandbox_verification_suite, LocalOsSandbox};
 use runbay_scheduler::{CancelToken, GuardedRunSink};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+use supervisor::DaemonConfig;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
+        Some("__internal-fixture-worker") => fixture_worker::run_fixture_worker().await,
         Some("self-check") => run_self_check().await,
         Some("serve") => {
-            let port: u16 = args
-                .windows(2)
-                .find(|w| w[0] == "--port")
-                .and_then(|w| w[1].parse().ok())
-                .unwrap_or(7310);
-            run_loopback_server(port).await
+            let config = parse_serve_args(&args[1..])?;
+            server::run_loopback_server(config).await
         }
         Some("--version") | Some("-V") => {
             println!("runbayd {}", env!("CARGO_PKG_VERSION"));
@@ -36,7 +35,21 @@ async fn main() -> Result<()> {
         }
         _ => {
             println!(
-                "runbayd {} — local runtime daemon\n\nUsage:\n  runbayd self-check          Verify OS sandbox, MVCC/CoW branching, gateway, and cancel guard\n  runbayd serve [--port PORT] Start loopback control server (default 7310)",
+                "runbayd {} — local runtime daemon\n\n\
+                 Usage:\n\
+                   runbayd self-check          Verify OS sandbox, MVCC/CoW branching, gateway, and cancel guard\n\
+                   runbayd serve [OPTIONS]     Start authenticated loopback HTTP + SSE control daemon\n\n\
+                 Serve options:\n\
+                   --port <PORT>                      Loopback TCP port (default 7310; 0 for ephemeral)\n\
+                   --state-dir <DIR>                  Durable state directory (default ~/.runbay)\n\
+                   --token <TOKEN>                    Control bearer token (or env RUNBAY_CONTROL_TOKEN; auto-generated if omitted)\n\
+                   --allow-workspace-root <DIR>       Allowed base root for agent workspaces (repeatable)\n\
+                   --max-concurrent-runs <N>          Max simultaneous live runs (default 4)\n\
+                   --max-queued-runs <N>              Max queued runs before 429 (default 32)\n\
+                   --default-timeout-secs <N>         Default per-run timeout seconds (default 300)\n\
+                   --upstream-url <URL>               Upstream OpenAI-compatible URL for secretless gateway (uses env RUNBAY_UPSTREAM_API_KEY)\n\
+                   --codex-bin <PATH>                 Explicit codex executable path\n\
+                   --enable-fixture-adapter           Opt-in: enable built-in deterministic protocol fixture adapter (for tests/CI)",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())
@@ -44,19 +57,137 @@ async fn main() -> Result<()> {
     }
 }
 
+fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
+    let mut port: u16 = 7310;
+    let mut state_dir: Option<PathBuf> = None;
+    let mut control_token: Option<String> = std::env::var("RUNBAY_CONTROL_TOKEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let mut max_concurrent_runs: usize = 4;
+    let mut max_queued_runs: usize = 32;
+    let mut default_timeout_secs: u64 = 300;
+    let mut allowed_workspace_roots: Vec<PathBuf> = Vec::new();
+    let mut upstream_url: Option<String> = std::env::var("RUNBAY_UPSTREAM_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let upstream_api_key: Option<String> = std::env::var("RUNBAY_UPSTREAM_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let mut enable_fixture_adapter = false;
+    let mut codex_bin: Option<PathBuf> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--port requires value"))?;
+                port = v.parse()?;
+            }
+            "--state-dir" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--state-dir requires value"))?;
+                state_dir = Some(PathBuf::from(v));
+            }
+            "--token" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--token requires value"))?;
+                if v.trim().is_empty() {
+                    bail!("--token cannot be empty");
+                }
+                control_token = Some(v.clone());
+            }
+            "--allow-workspace-root" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--allow-workspace-root requires path"))?;
+                allowed_workspace_roots.push(PathBuf::from(v));
+            }
+            "--max-concurrent-runs" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--max-concurrent-runs requires value"))?;
+                max_concurrent_runs = v.parse::<usize>()?.max(1);
+            }
+            "--max-queued-runs" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--max-queued-runs requires value"))?;
+                max_queued_runs = v.parse::<usize>()?.max(1);
+            }
+            "--default-timeout-secs" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--default-timeout-secs requires value"))?;
+                default_timeout_secs = v.parse::<u64>()?.clamp(1, auth::MAX_TIMEOUT_SECS);
+            }
+            "--upstream-url" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--upstream-url requires URL"))?;
+                upstream_url = Some(v.clone());
+            }
+            "--codex-bin" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--codex-bin requires path"))?;
+                codex_bin = Some(PathBuf::from(v));
+            }
+            "--enable-fixture-adapter" => {
+                enable_fixture_adapter = true;
+            }
+            other => bail!("unknown serve flag: {other}"),
+        }
+        i += 1;
+    }
+
+    let state_dir = state_dir.unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".runbay")
+    });
+    let control_token = control_token.unwrap_or_else(|| generate_csprng_token("rb_ctl_"));
+
+    Ok(DaemonConfig {
+        port,
+        state_dir,
+        control_token,
+        max_concurrent_runs,
+        max_queued_runs,
+        default_timeout_secs,
+        allowed_workspace_roots,
+        upstream_url,
+        upstream_api_key,
+        enable_fixture_adapter,
+        codex_bin,
+    })
+}
+
 async fn run_self_check() -> Result<()> {
     let tmp = TempDir::new()?;
     let src = tmp.path().join("src");
     fs::create_dir_all(&src)?;
-    fs::write(src.join("doc_0.md"), "# Core\n\nRunbay MVCC self-check canary.\n")?;
+    fs::write(
+        src.join("doc_0.md"),
+        "# Core\n\nRunbay MVCC self-check canary.\n",
+    )?;
 
     let store = MVCCWorkspaceStore::new(tmp.path().join("mvcc"), &src)?;
-    let proxy = SharedOutOfSandboxDerivedProxy::new(
-        tmp.path().join("proxy"),
-        Arc::clone(&store),
-        32,
-        256,
-    )?;
+    let proxy =
+        SharedOutOfSandboxDerivedProxy::new(tmp.path().join("proxy"), Arc::clone(&store), 32, 256)?;
     let lease0 = store.pin_snapshot(Some(0))?;
     let mut up = BTreeMap::new();
     up.insert("doc_1.md".into(), "# Delta\n\nNew rev1 content.\n".into());
@@ -101,41 +232,4 @@ async fn run_self_check() -> Result<()> {
     });
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
-}
-
-async fn run_loopback_server(port: u16) -> Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-    let local = listener.local_addr()?;
-    println!("runbayd listening on http://{local}");
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        tokio::spawn(async move {
-            let svc = service_fn(|req: Request<Incoming>| async move {
-                let path = req.uri().path();
-                let (status, body) = match path {
-                    "/health" => (StatusCode::OK, serde_json::json!({"status": "ok"})),
-                    "/v1/status" => (
-                        StatusCode::OK,
-                        serde_json::json!({
-                            "service": "runbayd",
-                            "version": env!("CARGO_PKG_VERSION"),
-                            "components": ["runbay-mvcc", "runbay-sandbox", "runbay-gateway", "runbay-scheduler"]
-                        }),
-                    ),
-                    _ => (
-                        StatusCode::NOT_FOUND,
-                        serde_json::json!({"error": "not_found"}),
-                    ),
-                };
-                let resp: Response<BoxBody<Bytes, Infallible>> = Response::builder()
-                    .status(status)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(body.to_string())).boxed())
-                    .unwrap();
-                Ok::<_, Infallible>(resp)
-            });
-            let _ = http1::Builder::new().serve_connection(io, svc).await;
-        });
-    }
 }

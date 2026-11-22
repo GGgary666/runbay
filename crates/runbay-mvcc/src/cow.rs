@@ -114,7 +114,11 @@ fn try_linux_ficlone_tree(src: &Path, dst: &Path) -> bool {
             }
         }
     }
-    cloned_any_file || !src.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false)
+    cloned_any_file
+        || !src
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
 }
 
 #[cfg(not(target_os = "linux"))]

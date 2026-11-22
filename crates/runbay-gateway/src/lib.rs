@@ -108,10 +108,13 @@ pub fn resolve_allowed_upstream_url(
 }
 
 /// Async 127.0.0.1 OpenAI-compatible reverse proxy that injects real API keys outside sandboxes.
+/// On Unix, may also bind a Unix domain socket (`bind_unix_socket`) so Linux `bwrap --unshare-net`
+/// sandboxes can reach ONLY the gateway with zero host network exposure.
 pub struct SecretlessLoopbackGateway {
     inner: Arc<GatewayInner>,
     port: u16,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    unix_sockets: Mutex<Vec<(std::path::PathBuf, oneshot::Sender<()>)>>,
 }
 
 impl SecretlessLoopbackGateway {
@@ -130,9 +133,12 @@ impl SecretlessLoopbackGateway {
         let addr: SocketAddr = listener.local_addr()?;
         let port = addr.port();
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(45))
-            .build()?;
+        let mut client_builder =
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(45));
+        if matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
+            client_builder = client_builder.no_proxy();
+        }
+        let client = client_builder.build()?;
 
         let inner = Arc::new(GatewayInner {
             upstream_base_url: parsed,
@@ -176,7 +182,54 @@ impl SecretlessLoopbackGateway {
             inner,
             port,
             shutdown_tx: Some(shutdown_tx),
+            unix_sockets: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Bind an additional Unix domain socket listener serving the exact same secretless gateway.
+    /// This enables Linux `bubblewrap --unshare-net` sandboxes to reach ONLY this gateway via
+    /// `--bind <sock> <sock>` without disabling network namespace isolation.
+    #[cfg(unix)]
+    pub async fn bind_unix_socket(
+        &self,
+        socket_path: impl AsRef<std::path::Path>,
+    ) -> Result<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = socket_path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+
+        let (tx, mut rx) = oneshot::channel::<()>();
+        let accept_inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut rx => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, _peer)) = accepted else { break };
+                        let io = TokioIo::new(stream);
+                        let svc_inner = Arc::clone(&accept_inner);
+                        tokio::spawn(async move {
+                            let service = service_fn(move |req| {
+                                let state = Arc::clone(&svc_inner);
+                                async move { Ok::<_, Infallible>(handle_request(state, req).await) }
+                            });
+                            let _ = http1::Builder::new().serve_connection(io, service).await;
+                        });
+                    }
+                }
+            }
+        });
+
+        self.unix_sockets.lock().push((canonical.clone(), tx));
+        Ok(canonical)
     }
 
     pub fn port(&self) -> u16 {
@@ -222,10 +275,7 @@ impl SecretlessLoopbackGateway {
         GatewayStats {
             gateway_port: self.port,
             total_calls: calls.len(),
-            unauthorized_attempts_blocked: self
-                .inner
-                .unauthorized_attempts
-                .load(Ordering::Relaxed),
+            unauthorized_attempts_blocked: self.inner.unauthorized_attempts.load(Ordering::Relaxed),
             calls,
         }
     }
@@ -234,6 +284,10 @@ impl SecretlessLoopbackGateway {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+        for (path, tx) in self.unix_sockets.lock().drain(..) {
+            let _ = tx.send(());
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -241,6 +295,10 @@ impl Drop for SecretlessLoopbackGateway {
     fn drop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
+        }
+        for (path, tx) in self.unix_sockets.lock().drain(..) {
+            let _ = tx.send(());
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -589,9 +647,10 @@ async fn handle_request(
                                     if let Some(cb) = stream_state.on_specbox_tool.as_ref() {
                                         let cb_clone = Arc::clone(cb);
                                         let name_owned = fn_name.clone();
-                                        prewarm_task = Some(tokio::task::spawn_blocking(move || {
-                                            cb_clone(&name_owned)
-                                        }));
+                                        prewarm_task =
+                                            Some(tokio::task::spawn_blocking(move || {
+                                                cb_clone(&name_owned)
+                                            }));
                                     }
                                 }
                             }
@@ -729,10 +788,43 @@ impl MockUpstreamServer {
                                     if let Some(a) = req.headers().get("authorization").and_then(|v| v.to_str().ok()) {
                                         seen_ref.lock().push(a.to_string());
                                     }
+                                    let req_path = req.uri().path().to_string();
                                     let body_bytes = req.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
                                     let j: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
                                     let is_stream = j.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
                                     let stall_stream = j.get("stall_stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                                    if req_path.ends_with("/responses") {
+                                        if is_stream {
+                                            let sse = concat!(
+                                                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_mock_1\",\"status\":\"in_progress\"}}\n\n",
+                                                "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_mock_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+                                                "event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"item_id\":\"msg_mock_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+                                                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_mock_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"RUNBAY_MOCK_OK\"}\n\n",
+                                                "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_mock_1\",\"output_index\":0,\"content_index\":0,\"text\":\"RUNBAY_MOCK_OK\"}\n\n",
+                                                "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_mock_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"RUNBAY_MOCK_OK\"}]}}\n\n",
+                                                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_mock_1\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_mock_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"RUNBAY_MOCK_OK\"}]}],\"usage\":{\"input_tokens\":24,\"output_tokens\":4,\"total_tokens\":28,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":0}}}}\n\n"
+                                            );
+                                            let resp = Response::builder()
+                                                .status(StatusCode::OK)
+                                                .header("content-type", "text/event-stream")
+                                                .body(Full::new(Bytes::from_static(sse.as_bytes())).boxed())
+                                                .unwrap();
+                                            return Ok::<_, Infallible>(resp);
+                                        }
+                                        let payload = serde_json::json!({
+                                            "id": "resp_mock_1",
+                                            "status": "completed",
+                                            "output": [{
+                                                "id": "msg_mock_1",
+                                                "type": "message",
+                                                "role": "assistant",
+                                                "status": "completed",
+                                                "content": [{"type": "output_text", "text": "RUNBAY_MOCK_OK"}]
+                                            }],
+                                            "usage": {"input_tokens": 24, "output_tokens": 4}
+                                        });
+                                        return Ok::<_, Infallible>(json_response(StatusCode::OK, Bytes::from(payload.to_string())));
+                                    }
                                     if stall_stream {
                                         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(4);
                                         tokio::spawn(async move {
@@ -807,9 +899,9 @@ impl Drop for MockUpstreamServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runbay_sandbox::{LocalOsSandbox, SandboxRunOptions};
     use std::collections::BTreeMap;
     use std::fs;
-    use runbay_sandbox::{LocalOsSandbox, SandboxRunOptions};
     use tempfile::TempDir;
 
     #[test]
@@ -958,7 +1050,10 @@ mod tests {
         assert_eq!(stats.unauthorized_attempts_blocked, 1);
         assert_eq!(stats.total_calls, 1);
         let rec = &stats.calls[0];
-        assert_eq!(rec.specbox_tool_detected.as_deref(), Some("search_workspace"));
+        assert_eq!(
+            rec.specbox_tool_detected.as_deref(),
+            Some("search_workspace")
+        );
         assert_eq!(rec.specbox_prewarm_ms, Some(1.25));
         assert!(rec.specbox_prewarm_error.is_none());
         assert_eq!(rec.cached_tokens, 1024);
@@ -1029,9 +1124,13 @@ mod tests {
         let secrets = tmp.path().join("secrets");
         fs::create_dir_all(&ws).unwrap();
         fs::create_dir_all(&secrets).unwrap();
-        fs::write(secrets.join(".env"), "API_KEY=host-real-key-never-in-sandbox\n").unwrap();
+        fs::write(
+            secrets.join(".env"),
+            "API_KEY=host-real-key-never-in-sandbox\n",
+        )
+        .unwrap();
 
-        let sb = LocalOsSandbox::new(&pool, &[secrets.clone()]);
+        let sb = LocalOsSandbox::new(&pool, std::slice::from_ref(&secrets));
         if !sb.is_available() {
             return;
         }
@@ -1039,37 +1138,60 @@ mod tests {
         let tok = gw.mint_run_token("sandbox-e2e", Some("test-model".into()));
         let mut env_overrides = BTreeMap::new();
         env_overrides.insert("RUNBAY_RUN_TOKEN".into(), tok);
-        env_overrides.insert("RUNBAY_GATEWAY_URL".into(), gw.base_url());
-        let gw_port = gw.port();
-        let ws_clone = ws.clone();
 
-        // On macOS Seatbelt, also assert direct internet is kernel-denied while loopback port is open.
-        let net_check = if cfg!(target_os = "macos") {
-            "if curl -sS --max-time 1 https://1.1.1.1 >/dev/null 2>&1; then echo NET_LEAKED; exit 3; fi; "
-        } else {
-            ""
-        };
-        let script = format!(
-            "if cat \"{}/.env\" >/dev/null 2>&1; then echo ENV_LEAKED; exit 2; fi; \
-             {net_check}\
-             curl -sS --max-time 5 -X POST \"$RUNBAY_GATEWAY_URL/chat/completions\" \
-               -H \"Authorization: Bearer $RUNBAY_RUN_TOKEN\" \
-               -H \"Content-Type: application/json\" \
-               -d '{{\"model\":\"test-model\",\"stream\":false}}'",
-            secrets.display()
-        );
-
-        let res = tokio::task::spawn_blocking(move || {
-            sb.run(
-                &["/bin/sh".into(), "-c".into(), script],
-                &ws_clone,
-                &SandboxRunOptions {
+        // Both macOS (Seatbelt) and Linux (bwrap --unshare-net + bound Unix socket) MUST
+        // deny direct outbound internet while allowing ONLY the secretless gateway channel.
+        let (opts, curl_call) = if cfg!(target_os = "macos") {
+            env_overrides.insert("RUNBAY_GATEWAY_URL".into(), gw.base_url());
+            (
+                SandboxRunOptions {
                     allow_network: false,
-                    allowed_loopback_port: Some(gw_port),
+                    allowed_loopback_port: Some(gw.port()),
                     env_overrides,
                     ..Default::default()
                 },
+                "curl -sS --max-time 5 -X POST \"$RUNBAY_GATEWAY_URL/chat/completions\" \
+                   -H \"Authorization: Bearer $RUNBAY_RUN_TOKEN\" \
+                   -H \"Content-Type: application/json\" \
+                   -d '{\"model\":\"test-model\",\"stream\":false}'"
+                    .to_string(),
             )
+        } else {
+            let sock_path = gw
+                .bind_unix_socket(tmp.path().join("gw_sock/gateway.sock"))
+                .await
+                .unwrap();
+            env_overrides.insert(
+                "RUNBAY_GATEWAY_SOCKET".into(),
+                sock_path.to_string_lossy().to_string(),
+            );
+            (
+                SandboxRunOptions {
+                    allow_network: false,
+                    allowed_loopback_port: None,
+                    gateway_unix_socket: Some(sock_path),
+                    env_overrides,
+                    ..Default::default()
+                },
+                "curl -sS --max-time 5 --unix-socket \"$RUNBAY_GATEWAY_SOCKET\" \
+                   -X POST \"http://localhost/v1/chat/completions\" \
+                   -H \"Authorization: Bearer $RUNBAY_RUN_TOKEN\" \
+                   -H \"Content-Type: application/json\" \
+                   -d '{\"model\":\"test-model\",\"stream\":false}'"
+                    .to_string(),
+            )
+        };
+
+        let script = format!(
+            "if cat \"{}/.env\" >/dev/null 2>&1; then echo ENV_LEAKED; exit 2; fi; \
+             if curl -sS --max-time 1 https://1.1.1.1 >/dev/null 2>&1; then echo NET_LEAKED; exit 3; fi; \
+             {curl_call}",
+            secrets.display()
+        );
+
+        let ws_clone = ws.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            sb.run(&["/bin/sh".into(), "-c".into(), script], &ws_clone, &opts)
         })
         .await
         .unwrap()

@@ -524,6 +524,10 @@ impl MVCCWorkspaceStore {
     }
 
     pub fn branch_status(&self, branch_id: &str) -> Option<BranchStatus> {
-        self.state.read().branches.get(branch_id).map(|b| b.status.clone())
+        self.state
+            .read()
+            .branches
+            .get(branch_id)
+            .map(|b| b.status.clone())
     }
 }
