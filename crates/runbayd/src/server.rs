@@ -89,33 +89,33 @@ fn parse_query_param(query: Option<&str>, key: &str) -> Option<String> {
 
 async fn read_json_body<T: serde::de::DeserializeOwned>(
     req: Request<Incoming>,
-) -> Result<T, BoxedResponse> {
+) -> Result<T, Box<BoxedResponse>> {
     let limited = Limited::new(req.into_body(), MAX_BODY_BYTES);
     let collected = limited.collect().await.map_err(|err| {
         if err
             .downcast_ref::<http_body_util::LengthLimitError>()
             .is_some()
         {
-            error_resp(
+            Box::new(error_resp(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "payload_too_large",
                 format!("Request body exceeds {} byte limit", MAX_BODY_BYTES),
-            )
+            ))
         } else {
-            error_resp(
+            Box::new(error_resp(
                 StatusCode::BAD_REQUEST,
                 "invalid_body",
                 format!("Failed to read request body: {err}"),
-            )
+            ))
         }
     })?;
     let bytes = collected.to_bytes();
     serde_json::from_slice::<T>(&bytes).map_err(|err| {
-        error_resp(
+        Box::new(error_resp(
             StatusCode::BAD_REQUEST,
             "invalid_json",
             format!("Invalid JSON payload: {err}"),
-        )
+        ))
     })
 }
 
@@ -185,7 +185,7 @@ async fn handle_http_request(sup: Arc<DaemonSupervisor>, req: Request<Incoming>)
     if method == Method::POST && path == "/agents" {
         let payload: RegisterAgentRequest = match read_json_body(req).await {
             Ok(v) => v,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
         return match sup.register_agent(payload) {
             Ok(view) => json_resp(StatusCode::CREATED, serde_json::to_value(view).unwrap()),
@@ -239,7 +239,7 @@ async fn handle_http_request(sup: Arc<DaemonSupervisor>, req: Request<Incoming>)
             (Method::POST, [agent_id, "run"]) => {
                 let payload: SubmitRunRequest = match read_json_body(req).await {
                     Ok(v) => v,
-                    Err(resp) => return resp,
+                    Err(resp) => return *resp,
                 };
                 return match sup.submit_run(agent_id, payload) {
                     Ok(run) => json_resp(StatusCode::ACCEPTED, serde_json::to_value(run).unwrap()),
