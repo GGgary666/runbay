@@ -38,6 +38,14 @@ jobs:
       - name: Run full workspace unit, OS sandbox, and black-box daemon E2E tests
         run: cargo test --workspace --locked -- --nocapture
 
+      - name: Exercise real per-run cgroup limits in a delegated Linux service
+        if: runner.os == 'Linux'
+        run: |
+          sudo systemd-run --quiet --wait --pipe --collect --uid="$(id -un)" \
+            --working-directory="$PWD" --property=Delegate=yes \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            sh scripts/with-delegated-cgroup.sh cargo test --workspace --locked cgroup -- --ignored --nocapture
+
       - name: Run runbayd self-check
         run: cargo run -p runbayd --locked -- self-check
 

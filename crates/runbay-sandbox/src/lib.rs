@@ -1,4 +1,7 @@
+mod cgroup;
 use anyhow::{bail, Context, Result};
+use cgroup::RunCgroup;
+pub use cgroup::{clean_interrupted_cgroup, validate_cgroup_parent, SandboxCgroup, SandboxLimits};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -29,6 +32,7 @@ pub struct SandboxRunOptions {
     /// Unix domain socket path bound into the sandbox for secretless gateway access
     /// under `--unshare-net` on Linux (and allowed as a literal outbound socket on macOS).
     pub gateway_unix_socket: Option<PathBuf>,
+    pub cgroup: Option<SandboxCgroup>,
     pub env_overrides: BTreeMap<String, String>,
 }
 
@@ -37,9 +41,18 @@ pub struct SandboxedChild {
     pub child: tokio::process::Child,
     pgid: Option<i32>,
     _profile_guard: Option<NamedTempFile>,
+    cgroup: Option<RunCgroup>,
 }
 
 impl SandboxedChild {
+    /// Release the cgroup before publishing the terminal run event.
+    pub async fn finish_resources(&mut self) -> Result<()> {
+        if let Some(group) = self.cgroup.take() {
+            tokio::task::spawn_blocking(move || group.close()).await??;
+        }
+        Ok(())
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
     }
@@ -242,6 +255,9 @@ impl MacOSSeatbeltSandbox {
             bail!("sandbox command cannot be empty");
         }
 
+        if opts.cgroup.is_some() {
+            bail!("sandbox cgroup limits require Linux");
+        }
         let profile_text = self.build_profile(allowed_workspace, opts);
         let ws_real =
             fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
@@ -284,6 +300,7 @@ impl MacOSSeatbeltSandbox {
             child,
             pgid,
             _profile_guard: Some(tf),
+            cgroup: None,
         })
     }
 
@@ -300,6 +317,9 @@ impl MacOSSeatbeltSandbox {
             bail!("sandbox command cannot be empty");
         }
 
+        if opts.cgroup.is_some() {
+            bail!("sandbox cgroup limits require Linux");
+        }
         let profile_text = self.build_profile(allowed_workspace, opts);
         let ws_real =
             fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
@@ -524,6 +544,11 @@ impl LinuxBubblewrapSandbox {
             });
         }
 
+        let cgroup = opts
+            .cgroup
+            .as_ref()
+            .map(|spec| RunCgroup::prepare(command.as_std_mut(), spec))
+            .transpose()?;
         let child = command
             .spawn()
             .with_context(|| format!("failed to spawn bwrap sandboxed process {:?}", cmd))?;
@@ -532,6 +557,7 @@ impl LinuxBubblewrapSandbox {
             child,
             pgid,
             _profile_guard: None,
+            cgroup,
         })
     }
 
@@ -563,9 +589,17 @@ impl LinuxBubblewrapSandbox {
         }
 
         let t0 = Instant::now();
+        let cgroup = opts
+            .cgroup
+            .as_ref()
+            .map(|spec| RunCgroup::prepare(&mut command, spec))
+            .transpose()?;
         let output = command
             .output()
             .with_context(|| format!("failed to spawn bwrap sandboxed process {:?}", cmd))?;
+        if let Some(group) = cgroup {
+            group.close()?;
+        }
         let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
 
         let returncode = output.status.code().unwrap_or(-1);

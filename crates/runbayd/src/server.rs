@@ -523,9 +523,9 @@ async fn stream_agent_sse(sup: Arc<DaemonSupervisor>, agent_id: String) -> Boxed
 }
 
 pub async fn run_loopback_server(config: DaemonConfig) -> Result<()> {
-    let token_path = write_control_token_file(&config.state_dir, &config.control_token)?;
     let port = config.port;
     let sup = DaemonSupervisor::new(config).await?;
+    let token_path = write_control_token_file(&sup.config.state_dir, &sup.config.control_token)?;
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let local: SocketAddr = listener.local_addr()?;
 

@@ -567,6 +567,12 @@ async fn test_daemon_cowiki_qa_through_unix_socket() {
         .unwrap();
     assert_eq!(registered.status(), 201);
 
+    let unavailable = client.post(format!("{}/agents/wiki-qa/run", daemon.base_url))
+        .bearer_auth(&daemon.token).json(&serde_json::json!({
+            "prompt": QUESTION, "resource_limits": {"cpu_percent": 20, "memory_mib": 64, "max_pids": 16}
+        })).send().await.unwrap();
+    assert_eq!(unavailable.status(), 400);
+
     let submitted = client
         .post(format!("{}/agents/wiki-qa/run", daemon.base_url))
         .bearer_auth(&daemon.token)
@@ -613,6 +619,177 @@ async fn test_daemon_cowiki_qa_through_unix_socket() {
         upstream.seen_auth_headers(),
         ["Bearer cowiki-mock-upstream-key"]
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a writable delegated cgroup v2 subtree; exercised by Linux CI"]
+async fn test_daemon_cgroup_cancel_timeout_and_concurrent_qa() {
+    use serde_json::json;
+    let parent = PathBuf::from(std::env::var_os("RUNBAY_CGROUP_ROOT").expect("delegated parent"));
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().join("wiki");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("paper-note.md"), wiki_sample::NOTE).unwrap();
+    let upstream = wiki_sample::model().await;
+    let mut daemon = SpawnedDaemon::spawn(
+        &tmp.path().join("state"),
+        "rb_ctl_limit_test",
+        &[
+            "--sandbox-cgroup-root",
+            parent.to_str().unwrap(),
+            "--sandbox-cpu-percent",
+            "90",
+            "--sandbox-memory-mib",
+            "160",
+            "--sandbox-max-pids",
+            "48",
+            "--enable-cowiki-adapter",
+            "--enable-fixture-adapter",
+            "--allow-workspace-root",
+            workspace.to_str().unwrap(),
+            "--upstream-url",
+            &upstream.base_url(),
+        ],
+        &[("RUNBAY_UPSTREAM_API_KEY", "test-key")],
+    );
+    let client = reqwest::Client::new();
+    for runtime in ["cowiki", "fixture"] {
+        let response = client
+            .post(format!("{}/agents", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&json!({"agent_id":runtime, "runtime":runtime, "workspace_dir":workspace}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+    }
+    let submit = |agent: &str, body: serde_json::Value| {
+        client
+            .post(format!("{}/agents/{agent}/run", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&body)
+            .send()
+    };
+    let limits = json!({"cpu_percent":50, "memory_mib":96, "max_pids":32});
+    let above_ceiling = submit(
+        "fixture",
+        json!({"prompt":"unused", "resource_limits":{
+            "cpu_percent":91, "memory_mib":96, "max_pids":32
+        }}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(above_ceiling.status(), 400);
+
+    for timed_out in [false, true] {
+        let slow = submit("fixture", json!({
+            "prompt":json!({"action":"sleep_with_grandchild","sleep_secs":30,"pid_file":"pids.json"}).to_string(),
+            "resource_limits":limits, "timeout_secs":if timed_out { 1 } else { 25 }
+        })).await.unwrap();
+        assert_eq!(slow.status(), 202);
+        let record: serde_json::Value = slow.json().await.unwrap();
+        let run_id = record["run_id"].as_str().unwrap();
+        let path = parent.join(format!("runbay-{run_id}"));
+        let running = wait_for_run_state(&client, &daemon, run_id, &["running"]).await;
+        assert_eq!(
+            fs::read_to_string(path.join("pids.max")).unwrap().trim(),
+            "32"
+        );
+        if timed_out {
+            let done = wait_for_run_state(&client, &daemon, run_id, &["failed"]).await;
+            assert_eq!(done["error_code"], "timeout");
+        } else {
+            let marker = Path::new(running["branch_workspace"].as_str().unwrap()).join("pids.json");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let process_count = fs::read_to_string(path.join("cgroup.procs"))
+                .unwrap()
+                .lines()
+                .count();
+            assert!(
+                process_count >= 2,
+                "worker and its child should share the run's cgroup"
+            );
+            let peer = submit(
+                "cowiki",
+                json!({"prompt":wiki_sample::QUESTION, "allowed_model":"deepseek-flash"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(peer.status(), 202);
+            let peer: serde_json::Value = peer.json().await.unwrap();
+            let peer_id = peer["run_id"].as_str().unwrap();
+            let events = collect_run_sse(&client, &daemon, peer_id, None).await;
+            assert!(events.iter().any(|e| e.event == "run.started"
+                && e.data["data"]["resource_limits"]
+                    == json!({"cpu_percent":90,"memory_mib":160,"max_pids":48})));
+            assert!(events
+                .iter()
+                .any(|e| e.data["data"]["answer"] == wiki_sample::ANSWER));
+            assert_eq!(events.last().unwrap().event, "run.succeeded");
+            assert!(!parent.join(format!("runbay-{peer_id}")).exists());
+            assert!(path.exists());
+            let cancelled = client
+                .post(format!("{}/runs/{run_id}/cancel", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(cancelled.status(), 200);
+            wait_for_run_state(&client, &daemon, run_id, &["cancelled"]).await;
+        }
+        assert!(!path.exists(), "terminal run still owns a cgroup");
+    }
+
+    let interrupted = submit("fixture", json!({
+        "prompt": json!({"action":"sleep_with_grandchild","sleep_secs":30,"pid_file":"restart.json"}).to_string()
+    })).await.unwrap();
+    let interrupted: serde_json::Value = interrupted.json().await.unwrap();
+    let run_id = interrupted["run_id"].as_str().unwrap();
+    wait_for_run_state(&client, &daemon, run_id, &["running"]).await;
+    let leaf = parent.join(format!("runbay-{run_id}"));
+    assert!(leaf.exists());
+    // A second daemon using this state must not "recover" the first daemon's active run.
+    let duplicate = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_runbayd"))
+            .args(["serve", "--port", "0", "--state-dir"])
+            .arg(tmp.path().join("state"))
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate.stderr).contains("cannot lock daemon state directory")
+    );
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("state/control/control.token"))
+            .unwrap()
+            .trim(),
+        daemon.token
+    );
+    assert!(leaf.exists());
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+
+    let restarted = SpawnedDaemon::spawn(
+        &tmp.path().join("state"),
+        &daemon.token,
+        &["--sandbox-cgroup-root", parent.to_str().unwrap()],
+        &[],
+    );
+    let recovered = wait_for_run_state(&client, &restarted, run_id, &["failed"]).await;
+    assert_eq!(recovered["error_code"], "daemon_restarted");
+    assert!(!leaf.exists());
 }
 
 #[tokio::test]

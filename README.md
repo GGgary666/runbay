@@ -15,7 +15,7 @@ Runbay provides an authenticated loopback execution daemon (`runbayd`) over HTTP
 | :--- | :--- | :--- |
 | Loopback Control Daemon (`runbayd serve`) | **Implemented** | Constant-time Bearer auth (`rb_ctl_*`), body/ID/workspace boundary checks, durable SQLite registry, `/health`, `/v1/status`, `/agents`, `/runs`, SSE `/events` with `Last-Event-ID` replay, `POST /runs/:id/cancel` |
 | Runtime Execution & Process-Group Cleanup | **Implemented** | Bounded live concurrency & queue (`429` when full), isolated per-run MVCC CoW workspace + RAII `SnapshotLease`, POSIX process-group (`setpgid` + `killpg`) cancel/timeout reaping, explicit `daemon_restarted` startup recovery |
-| Runtime Adapters | **Implemented (`one_shot`)** | Honest `one_shot` `codex` adapter (`codex exec --json --ephemeral` through secretless loopback gateway on macOS; fails closed on Linux `--unshare-net`) + opt-in `--enable-fixture-adapter` deterministic protocol worker for tests/CI |
+| Runtime Adapters | **Implemented (`one_shot`)** | Honest `one_shot` `codex` adapter (`codex exec --json --ephemeral` through secretless loopback gateway on macOS; fails closed on Linux `--unshare-net`) + opt-in `--enable-fixture-adapter` deterministic protocol worker for tests/CI, and opt-in Linux `cowiki` Markdown Q&A |
 | Cross-Platform OS Sandbox (`runbay-sandbox`) | **Implemented** | macOS Seatbelt (`sandbox-exec`) with loopback TCP gateway allowlist; Linux `bubblewrap` (`bwrap --unshare-net`) with bound Unix-domain-socket gateway channel (fails closed if TCP loopback is requested with `allow_network=false`) |
 | Secretless Model Gateway (`runbay-gateway`) | **Implemented** | `tokio` + `hyper` 1.x reverse proxy (TCP loopback + Unix domain socket) injecting real upstream API keys strictly on outbound hops; 256-bit `rb_*` tokens, route/model allowlists, `Notify`-driven immediate revocation |
 | Three-Layer MVCC / CoW Store (`runbay-mvcc`) | **Implemented** | L0 CAS hardlinks, L1 APFS `clonefile(2)` / Linux `FICLONE` CoW snapshots & branching, L2 shared SQLite FTS5 + dense index |
@@ -36,7 +36,7 @@ POST   /agents                  Register agent {agent_id, runtime, workspace_dir
 GET    /agents                  List registered agents and MVCC lease state
 GET    /agents/:id              Inspect one agent
 DELETE /agents/:id              Cancel active runs and delete agent state
-POST   /agents/:id/run          Submit a run {prompt, priority?, required_rev?, timeout_secs?, allowed_model?, sandbox_mode?}
+POST   /agents/:id/run          Submit a run {prompt, priority?, required_rev?, timeout_secs?, allowed_model?, sandbox_mode?, resource_limits?}
 GET    /agents/:id/events       SSE stream scoped to agent
 GET    /runs                    List recent runs (?agent_id=...)
 GET    /runs/:run_id            Query run state, exit code, sandbox/gateway flags, and event counts
@@ -53,6 +53,7 @@ GET    /runs/:run_id/events     SSE event stream with Last-Event-ID / ?after_seq
 | OS Subprocess Sandbox | `sandbox-exec` (Seatbelt) | `bubblewrap` (`bwrap --unshare-net`) |
 | Secretless Gateway Under `allow_network=false` | Loopback TCP (`localhost:<port>`) + Unix socket | Bound Unix domain socket (`--bind <sock> <sock>` + `--unshare-net`); **fails closed** on TCP-only loopback requests |
 | `codex` One-Shot Adapter (Gateway Mode) | Supported (`codex exec --json --ephemeral` via Seatbelt TCP loopback gateway) | Fails closed when `allow_network=false` (Codex CLI requires TCP loopback, not Unix sockets) |
+| Per-run CPU, memory and task limits | Unavailable | Optional delegated cgroup v2 subtree |
 | L1 CoW Cloning | `clonefile(2)` (APFS) | `ioctl(FICLONE)` (Btrfs/XFS) / fallback copy |
 | L0 CAS Hardlink Sharing & L2 MVCC Index | Supported | Supported |
 
@@ -105,6 +106,28 @@ python3 examples/cowiki-qa.py
 ```
 
 The example starts a temporary daemon on an available port, calls `deepseek-flash` once via the Unix socket, prints the answer and stops the daemon. The snapshot in the example contains the Macro-F1 metric on line 5. The returned source covers the complete note read by the worker (lines 1–5). The optional positional argument changes the question.
+
+## Linux per-run resource limits
+
+Pass `--sandbox-cgroup-root DIR` to `runbayd serve`, or set `RUNBAY_CGROUP_ROOT` to a delegated cgroup v2 directory with `cpu`, `memory` and `pids` enabled in `cgroup.subtree_control`. Each run gets its own child cgroup before the sandbox starts. Its children and threads share the budget. The kernel must expose `cgroup.kill` and `memory.swap.max`. The daemon disables swap for the run and releases its cgroup before reporting completion, cancellation or timeout. Restarting with the same state directory and delegated parent cleans up interrupted runs.
+
+| Daemon option | Default when enabled | Meaning |
+| --- | --- | --- |
+| `--sandbox-cpu-percent` | 100 | CPU quota, with 100 equal to one core |
+| `--sandbox-memory-mib` | 256 | Aggregate memory in MiB |
+| `--sandbox-max-pids` | 64 | Total processes and threads, including the sandbox wrapper |
+
+A plain `POST /agents/:id/run` uses all three daemon defaults. A caller may tighten them by supplying all three positive integers, for example `"resource_limits": {"cpu_percent": 50, "memory_mib": 96, "max_pids": 32}`. The daemon rejects requests above its ceilings or requests for limits on an unconfigured host. Read the configured ceilings from `GET /v1/status` and the applied limits from the `run.started` event.
+
+To try the kernel and daemon tests as a regular user in a fresh systemd service, use the following command. It exercises CPU throttling, memory and task caps, concurrent Q&A, cancellation and timeout. The service owns the temporary cgroup subtree.
+
+```bash
+systemd-run --user --quiet --wait --pipe --collect --property=Delegate=yes \
+  --working-directory="$PWD" --setenv="PATH=$PATH" \
+  sh scripts/with-delegated-cgroup.sh cargo test --workspace --locked cgroup -- --ignored --nocapture
+```
+
+To run a daemon with these defaults, replace the `cargo test …` portion with `target/debug/runbayd serve --enable-fixture-adapter` after building the binary.
 
 ## License
 
