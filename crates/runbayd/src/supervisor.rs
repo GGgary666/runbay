@@ -39,6 +39,7 @@ pub struct DaemonConfig {
     pub upstream_url: Option<String>,
     pub upstream_api_key: Option<String>,
     pub enable_fixture_adapter: bool,
+    pub enable_cowiki_adapter: bool,
     pub codex_bin: Option<PathBuf>,
 }
 
@@ -110,7 +111,11 @@ impl DaemonSupervisor {
         let store = DaemonStore::open(&state_dir.join("runbayd.sqlite"))?;
         let _recovered = store.recover_interrupted_runs()?;
 
-        let adapters = AdapterRegistry::build(cfg.enable_fixture_adapter, cfg.codex_bin.clone())?;
+        let adapters = AdapterRegistry::build(
+            cfg.enable_fixture_adapter,
+            cfg.enable_cowiki_adapter,
+            cfg.codex_bin.clone(),
+        )?;
 
         let (gateway, gateway_unix_socket) =
             if let (Some(url), Some(key)) = (&cfg.upstream_url, &cfg.upstream_api_key) {

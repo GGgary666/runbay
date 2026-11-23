@@ -767,6 +767,14 @@ pub struct MockUpstreamServer {
 
 impl MockUpstreamServer {
     pub async fn start() -> Result<Self> {
+        Self::start_with_chat_reply(|_| Some("Multi-Version Concurrency Control".into())).await
+    }
+
+    /// Return HTTP 400 when the supplied non-streaming chat fixture rejects a request.
+    pub async fn start_with_chat_reply(
+        reply: impl Fn(&serde_json::Value) -> Option<String> + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let reply = Arc::new(reply);
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let seen_auth = Arc::new(Mutex::new(Vec::new()));
@@ -781,9 +789,11 @@ impl MockUpstreamServer {
                         let Ok((stream, _)) = accepted else { break };
                         let io = TokioIo::new(stream);
                         let seen = Arc::clone(&auth_clone);
+                        let reply = Arc::clone(&reply);
                         tokio::spawn(async move {
                             let svc = service_fn(move |req: Request<Incoming>| {
                                 let seen_ref = Arc::clone(&seen);
+                                let reply = Arc::clone(&reply);
                                 async move {
                                     if let Some(a) = req.headers().get("authorization").and_then(|v| v.to_str().ok()) {
                                         seen_ref.lock().push(a.to_string());
@@ -844,9 +854,13 @@ impl MockUpstreamServer {
                                         return Ok::<_, Infallible>(resp);
                                     }
                                     if !is_stream {
+                                        let Some(answer) = reply(&j) else {
+                                            return Ok::<_, Infallible>(json_response(StatusCode::BAD_REQUEST, Bytes::from_static(b"{}")));
+                                        };
                                         let payload = serde_json::json!({
                                             "id": "mock-nonstream-1",
-                                            "choices": [{"message": {"role": "assistant", "content": "Multi-Version Concurrency Control"}}],
+                                            "model": j["model"],
+                                            "choices": [{"message": {"role": "assistant", "content": answer}}],
                                             "usage": {"prompt_tokens": 18, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 0}}
                                         });
                                         return Ok::<_, Infallible>(json_response(StatusCode::OK, Bytes::from(payload.to_string())));
@@ -1157,6 +1171,11 @@ mod tests {
                     .to_string(),
             )
         } else {
+            // Positive control for the exact host port tested from the isolated namespace below.
+            tokio::net::TcpStream::connect(("127.0.0.1", gw.port()))
+                .await
+                .unwrap();
+            env_overrides.insert("HOST_GATEWAY_PORT".into(), gw.port().to_string());
             let sock_path = gw
                 .bind_unix_socket(tmp.path().join("gw_sock/gateway.sock"))
                 .await
@@ -1173,11 +1192,16 @@ mod tests {
                     env_overrides,
                     ..Default::default()
                 },
-                "curl -sS --max-time 5 --unix-socket \"$RUNBAY_GATEWAY_SOCKET\" \
-                   -X POST \"http://localhost/v1/chat/completions\" \
-                   -H \"Authorization: Bearer $RUNBAY_RUN_TOKEN\" \
-                   -H \"Content-Type: application/json\" \
-                   -d '{\"model\":\"test-model\",\"stream\":false}'"
+                r#"python3 -c '
+import os, socket
+for address in [("127.0.0.1", int(os.environ["HOST_GATEWAY_PORT"])), ("1.1.1.1", 443)]:
+    with socket.socket() as connection:
+        connection.settimeout(1)
+        if connection.connect_ex(address) == 0:
+            raise SystemExit(f"unexpected TCP connection to {address}")
+' && curl -fsS --max-time 5 --unix-socket "$RUNBAY_GATEWAY_SOCKET" -X POST \
+    http://localhost/v1/chat/completions -H "Authorization: Bearer $RUNBAY_RUN_TOKEN" \
+    -H 'Content-Type: application/json' -d '{"model":"test-model","stream":false}'"#
                     .to_string(),
             )
         };
@@ -1199,6 +1223,7 @@ mod tests {
 
         assert_eq!(res.returncode, 0, "stderr: {}", res.stderr);
         assert!(res.stdout.contains("Multi-Version Concurrency Control"));
+        assert_eq!(gw.stats().calls[0].status_code, 200);
         assert!(!res.stdout.contains("host-real-key-never-in-sandbox"));
         assert_eq!(
             mock.seen_auth_headers(),

@@ -87,6 +87,25 @@ target/release/beta-bench \
 
 See [docs/DESIGN.md](docs/DESIGN.md) for architecture details and [beta-bench/README.md](beta-bench/README.md) for benchmark methodology and measurement categories.
 
+## CoWiki Markdown example (Linux)
+
+Run from the repository root on Linux with working rootless `bwrap`. On Ubuntu systems with restricted unprivileged user namespaces, the distribution's `bwrap-userns-restrict` AppArmor profile can grant bubblewrap the required namespace permissions.
+
+The offline example starts the daemon, registers the [sample note](examples/cowiki/paper-note.md), and prints an answer with its source range. The local model fixture checks the actual question and the complete note received through the gateway.
+
+```bash
+cargo test -p runbayd --locked --test daemon_e2e test_daemon_cowiki_qa_through_unix_socket -- --exact --nocapture
+```
+
+For one live DeepSeek request, supply `RUNBAY_UPSTREAM_API_KEY` to the daemon from your secret store. Run these commands in that environment. Python 3 uses only its standard library.
+
+```bash
+cargo build -p runbayd --locked
+python3 examples/cowiki-qa.py
+```
+
+The example starts a temporary daemon on an available port, calls `deepseek-flash` once via the Unix socket, prints the answer and stops the daemon. The snapshot in the example contains the Macro-F1 metric on line 5. The returned source covers the complete note read by the worker (lines 1–5). The optional positional argument changes the question.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).

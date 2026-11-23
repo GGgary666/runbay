@@ -1,3 +1,4 @@
+use crate::cowiki::CowikiAdapter;
 use crate::models::{AdapterCapabilities, CapabilityTier};
 use anyhow::{bail, Result};
 use runbay_sandbox::SandboxRunOptions;
@@ -310,13 +311,21 @@ pub struct AdapterRegistry {
 }
 
 impl AdapterRegistry {
-    pub fn build(enable_fixture: bool, codex_bin: Option<PathBuf>) -> Result<Self> {
+    pub fn build(
+        enable_fixture: bool,
+        enable_cowiki: bool,
+        codex_bin: Option<PathBuf>,
+    ) -> Result<Self> {
         let mut adapters: BTreeMap<String, Box<dyn RuntimeAdapter>> = BTreeMap::new();
         let codex = CodexOneShotAdapter::discover(codex_bin);
         adapters.insert(codex.name().to_string(), Box::new(codex));
         if enable_fixture {
             let fixture = FixtureProtocolAdapter::new()?;
             adapters.insert(fixture.name().to_string(), Box::new(fixture));
+        }
+        if enable_cowiki {
+            let cowiki = CowikiAdapter::new()?;
+            adapters.insert(cowiki.name().to_string(), Box::new(cowiki));
         }
         Ok(Self { adapters })
     }

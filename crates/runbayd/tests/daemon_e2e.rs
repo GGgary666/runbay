@@ -24,6 +24,9 @@ impl SpawnedDaemon {
     ) -> Self {
         let bin = env!("CARGO_BIN_EXE_runbayd");
         let mut cmd = Command::new(bin);
+        cmd.env_remove("RUNBAY_UPSTREAM_API_KEY")
+            .env_remove("RUNBAY_UPSTREAM_URL")
+            .env_remove("RUNBAY_CGROUP_ROOT");
         cmd.arg("serve")
             .arg("--port")
             .arg("0")
@@ -506,6 +509,110 @@ async fn test_daemon_register_submit_sse_gateway_and_sandbox_isolation() {
         .await
         .unwrap();
     assert_eq!(agent_after["active_leases"], 0);
+}
+
+#[cfg(target_os = "linux")]
+mod wiki_sample {
+    use super::MockUpstreamServer;
+    pub const NOTE: &str = include_str!("../../../examples/cowiki/paper-note.md");
+    pub const QUESTION: &str = "这份论文笔记里的主要评测指标是什么？";
+    pub const ANSWER: &str = "主要评测指标是 Macro-F1（宏平均 F1）。";
+
+    pub async fn model() -> MockUpstreamServer {
+        MockUpstreamServer::start_with_chat_reply(|body| {
+            let messages = body["messages"].as_array()?;
+            let message = messages.iter().find(|m| m["role"] == "user")?["content"].as_str()?;
+            (body["model"] == "deepseek-flash"
+                && message.contains(QUESTION)
+                && message.contains(NOTE))
+            .then(|| ANSWER.to_owned())
+        })
+        .await
+        .unwrap()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_daemon_cowiki_qa_through_unix_socket() {
+    use wiki_sample::{ANSWER, NOTE, QUESTION};
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().join("wiki");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("paper-note.md"), NOTE).unwrap();
+    let upstream = wiki_sample::model().await;
+    let daemon = SpawnedDaemon::spawn(
+        &tmp.path().join("state"),
+        "rb_ctl_cowiki_test",
+        &[
+            "--allow-workspace-root",
+            workspace.to_str().unwrap(),
+            "--enable-cowiki-adapter",
+            "--upstream-url",
+            &upstream.base_url(),
+        ],
+        &[("RUNBAY_UPSTREAM_API_KEY", "cowiki-mock-upstream-key")],
+    );
+    let client = reqwest::Client::new();
+    let registered = client
+        .post(format!("{}/agents", daemon.base_url))
+        .bearer_auth(&daemon.token)
+        .json(&serde_json::json!({
+            "agent_id": "wiki-qa",
+            "runtime": "cowiki",
+            "workspace_dir": workspace,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(registered.status(), 201);
+
+    let submitted = client
+        .post(format!("{}/agents/wiki-qa/run", daemon.base_url))
+        .bearer_auth(&daemon.token)
+        .json(&serde_json::json!({
+            "prompt": QUESTION,
+            "allowed_model": "deepseek-flash",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), 202);
+    let run: serde_json::Value = submitted.json().await.unwrap();
+    let run_id = run["run_id"].as_str().unwrap();
+    let events = collect_run_sse(&client, &daemon, run_id, None).await;
+    assert_eq!(
+        events.last().map(|event| event.event.as_str()),
+        Some("run.succeeded"),
+        "{events:?}"
+    );
+    let answer = events
+        .iter()
+        .find(|event| event.event == "agent.event" && event.data["data"]["type"] == "cowiki.answer")
+        .map(|event| &event.data["data"])
+        .expect("expected a CoWiki answer event");
+    println!("Offline CoWiki answer: {answer}");
+    assert_eq!(answer["answer"], ANSWER);
+    assert_eq!(answer["requested_model"], "deepseek-flash");
+    assert_eq!(answer["model"], "deepseek-flash");
+    assert_eq!(answer["http_status"], 200);
+    assert_eq!(
+        answer["sources"],
+        serde_json::json!([{"path": "paper-note.md", "start_line": 1, "end_line": NOTE.lines().count()}])
+    );
+
+    let final_run = wait_for_run_state(&client, &daemon, run_id, &["succeeded"]).await;
+    assert_eq!(final_run["sandbox_enforced"], true);
+    assert_eq!(final_run["network_isolated"], true);
+    assert_eq!(final_run["secretless_gateway"], true);
+    assert_eq!(
+        final_run["gateway_transport"],
+        "linux_bwrap_unshare_net_unix_socket"
+    );
+    assert_eq!(
+        upstream.seen_auth_headers(),
+        ["Bearer cowiki-mock-upstream-key"]
+    );
 }
 
 #[tokio::test]

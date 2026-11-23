@@ -1,5 +1,6 @@
 mod adapters;
 mod auth;
+mod cowiki;
 mod fixture_worker;
 mod models;
 mod server;
@@ -24,6 +25,8 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
         Some("__internal-fixture-worker") => fixture_worker::run_fixture_worker().await,
+        #[cfg(target_os = "linux")]
+        Some("__internal-cowiki-worker") => cowiki::run_worker().await,
         Some("self-check") => run_self_check().await,
         Some("serve") => {
             let config = parse_serve_args(&args[1..])?;
@@ -49,7 +52,8 @@ async fn main() -> Result<()> {
                    --default-timeout-secs <N>         Default per-run timeout seconds (default 300)\n\
                    --upstream-url <URL>               Upstream OpenAI-compatible URL for secretless gateway (uses env RUNBAY_UPSTREAM_API_KEY)\n\
                    --codex-bin <PATH>                 Explicit codex executable path\n\
-                   --enable-fixture-adapter           Opt-in: enable built-in deterministic protocol fixture adapter (for tests/CI)",
+                   --enable-fixture-adapter           Opt-in: enable built-in deterministic protocol fixture adapter (for tests/CI)\n\
+                   --enable-cowiki-adapter            Opt-in: enable one-shot Markdown Q&A on Linux through the Unix socket gateway",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())
@@ -74,6 +78,7 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
         .ok()
         .filter(|s| !s.trim().is_empty());
     let mut enable_fixture_adapter = false;
+    let mut enable_cowiki_adapter = false;
     let mut codex_bin: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -148,6 +153,9 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
             "--enable-fixture-adapter" => {
                 enable_fixture_adapter = true;
             }
+            "--enable-cowiki-adapter" => {
+                enable_cowiki_adapter = true;
+            }
             other => bail!("unknown serve flag: {other}"),
         }
         i += 1;
@@ -172,6 +180,7 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
         upstream_url,
         upstream_api_key,
         enable_fixture_adapter,
+        enable_cowiki_adapter,
         codex_bin,
     })
 }
