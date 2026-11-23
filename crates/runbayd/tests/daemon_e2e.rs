@@ -613,7 +613,7 @@ async fn test_daemon_cowiki_qa_through_unix_socket() {
     assert_eq!(final_run["secretless_gateway"], true);
     assert_eq!(
         final_run["gateway_transport"],
-        "linux_bwrap_unshare_net_unix_socket"
+        runbay_sandbox::LocalOsSandbox::new(std::env::temp_dir(), &[]).gateway_transport()
     );
     assert_eq!(
         upstream.seen_auth_headers(),

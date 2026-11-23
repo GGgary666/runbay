@@ -142,7 +142,7 @@ impl RunCgroup {
             .write(true)
             .open(group.path.join("cgroup.procs"))?;
         // SAFETY: between fork and exec only use write(2) on a pre-opened CLOEXEC fd.
-        // Writing "0" moves the calling child before bwrap can fork any descendants.
+        // Writing "0" moves the calling child before the sandbox launcher can fork descendants.
         unsafe {
             cmd.pre_exec(move || loop {
                 if libc::write(procs.as_raw_fd(), b"0".as_ptr().cast(), 1) == 1 {

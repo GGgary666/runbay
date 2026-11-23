@@ -77,7 +77,6 @@ impl RuntimeAdapter for CowikiAdapter {
             },
             network_isolated: true,
             secretless_gateway: true,
-            gateway_transport: Some("linux_bwrap_unshare_net_unix_socket".to_string()),
         })
     }
 }

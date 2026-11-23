@@ -187,17 +187,10 @@ impl DaemonSupervisor {
     pub fn status(&self) -> Result<DaemonStatusResponse> {
         let probe_sb = LocalOsSandbox::new(&self.config.state_dir, &[]);
         let agents = self.store.list_agents()?;
-        let gw_transport = if self.gateway.is_some() {
-            if cfg!(target_os = "macos") {
-                Some("macos_seatbelt_loopback_tcp".to_string())
-            } else if self.gateway_unix_socket.is_some() {
-                Some("linux_bwrap_unshare_net_unix_socket".to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let gw_transport = (self.gateway.is_some()
+            && probe_sb.is_available()
+            && (cfg!(target_os = "macos") || self.gateway_unix_socket.is_some()))
+        .then(|| probe_sb.gateway_transport().to_owned());
         Ok(DaemonStatusResponse {
             service: "runbayd".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -826,7 +819,7 @@ impl DaemonSupervisor {
                 RunState::Failed,
                 None,
                 Some("sandbox_unavailable"),
-                Some("No supported OS sandbox binary available on this host"),
+                Some("Requested OS sandbox is unavailable. Check RUNBAY_SANDBOX_BACKEND, user namespaces and launcher installation."),
             );
             return;
         }
@@ -871,7 +864,9 @@ impl DaemonSupervisor {
         run.sandbox_enforced = true;
         run.network_isolated = prepared.network_isolated;
         run.secretless_gateway = prepared.secretless_gateway;
-        run.gateway_transport = prepared.gateway_transport.clone();
+        run.gateway_transport = prepared
+            .secretless_gateway
+            .then(|| sb.gateway_transport().to_owned());
         let _ = self.store.update_run(&run);
 
         self.emit_lifecycle_event(

@@ -268,8 +268,19 @@ async fn run_self_check() -> Result<()> {
         "incremental_equals_full": eq.exact_equivalence,
         "cancel_guard_ok": sink.accepted_count() == 1 && sink.rejected_late_count() == 1,
         "secretless_gateway_ok": gw_ok,
+        "sandbox_mechanism": probe_sb.mechanism_name(),
         "os_sandbox_ok": sb_ok
     });
     println!("{}", serde_json::to_string_pretty(&summary)?);
+    anyhow::ensure!(
+        sb_ok
+            && gw_ok
+            && eq.exact_equivalence
+            && rev0_future.hits.is_empty()
+            && !rev1_new.hits.is_empty()
+            && sink.accepted_count() == 1
+            && sink.rejected_late_count() == 1,
+        "runbayd self-check failed"
+    );
     Ok(())
 }

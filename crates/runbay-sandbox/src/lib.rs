@@ -1,4 +1,8 @@
 mod cgroup;
+#[cfg(runbay_native_linux)]
+mod native;
+#[cfg(target_os = "linux")]
+mod writable;
 use anyhow::{bail, Context, Result};
 use cgroup::RunCgroup;
 pub use cgroup::{clean_interrupted_cgroup, validate_cgroup_parent, SandboxCgroup, SandboxLimits};
@@ -112,6 +116,7 @@ fn detect_kernel_denial(returncode: i32, stderr: &str) -> bool {
             || stderr.contains("Read-only file system")
             || stderr.contains("Permission denied")
             || stderr.contains("No such file or directory")
+            || stderr.contains("Directory nonexistent")
             || stderr.contains("PermissionError")
             || stderr.contains("EPERM")
             || stderr.contains("EROFS")
@@ -365,7 +370,7 @@ impl MacOSSeatbeltSandbox {
     }
 }
 
-/// Linux unprivileged namespace sandbox backed by `bubblewrap` (`bwrap`).
+/// Linux namespace sandbox with bubblewrap and native Landlock + seccomp launchers.
 ///
 /// Enforces:
 /// - Global read-only root (`--ro-bind / /`): zero writes anywhere on host outside `allowed_workspace`;
@@ -373,13 +378,24 @@ impl MacOSSeatbeltSandbox {
 /// - Shared L0 read-only bind (`--ro-bind <l0> <l0>`);
 /// - Isolated workspace read-write bind (`--bind <ws> <ws>`);
 /// - Network namespace isolation (`--unshare-net`) when network is disabled.
-pub struct LinuxBubblewrapSandbox {
+pub struct LinuxSandbox {
     pool_root: PathBuf,
     forbidden_read_paths: Vec<PathBuf>,
-    bwrap_bin: Option<PathBuf>,
+    binary: Option<PathBuf>,
+    backend: LinuxBackend,
 }
 
-impl LinuxBubblewrapSandbox {
+#[derive(Clone, Copy, PartialEq)]
+enum LinuxBackend {
+    Bubblewrap,
+    Landlock,
+    Invalid,
+}
+
+/// Retained for callers which explicitly request bubblewrap.
+pub type LinuxBubblewrapSandbox = LinuxSandbox;
+
+impl LinuxSandbox {
     pub fn new(pool_root: impl AsRef<Path>, forbidden_read_paths: &[PathBuf]) -> Self {
         let pool_root = fs::canonicalize(pool_root.as_ref())
             .unwrap_or_else(|_| pool_root.as_ref().to_path_buf());
@@ -398,12 +414,92 @@ impl LinuxBubblewrapSandbox {
         Self {
             pool_root,
             forbidden_read_paths: forbidden,
-            bwrap_bin: bin,
+            binary: bin,
+            backend: LinuxBackend::Bubblewrap,
         }
     }
 
     pub fn is_available(&self) -> bool {
-        self.bwrap_bin.is_some()
+        let Some(binary) = &self.binary else {
+            return false;
+        };
+        #[cfg(runbay_native_linux)]
+        if self.backend == LinuxBackend::Landlock {
+            return native::available(binary);
+        }
+        Self::bwrap_works(binary)
+    }
+
+    fn bwrap_works(binary: &Path) -> bool {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            Command::new(binary)
+                .env_clear()
+                .args([
+                    "--unshare-net",
+                    "--unshare-pid",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--",
+                    "/bin/true",
+                ])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+    }
+
+    fn selected(pool: impl AsRef<Path>, forbidden: &[PathBuf]) -> Self {
+        let mut sb = Self::new(pool, forbidden);
+        let preference = std::env::var("RUNBAY_SANDBOX_BACKEND").unwrap_or_else(|_| "auto".into());
+        match preference.as_str() {
+            "bwrap" => return sb,
+            "auto" if sb.is_available() => return sb,
+            "landlock" | "auto" => {
+                sb.backend = LinuxBackend::Landlock;
+                sb.binary = None;
+                #[cfg(runbay_native_linux)]
+                {
+                    sb.binary = native::launcher();
+                }
+            }
+            _ => {
+                sb.backend = LinuxBackend::Invalid;
+                sb.binary = None;
+            }
+        }
+        sb
+    }
+
+    fn command(&self, cmd: &[String], ws: &Path, opts: &SandboxRunOptions) -> Result<Command> {
+        let binary = self
+            .binary
+            .as_ref()
+            .context("requested Linux sandbox backend unavailable")?;
+        if cmd.is_empty() {
+            bail!("sandbox command cannot be empty");
+        }
+        let mut command = Command::new(binary);
+        command
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", ws)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .envs(&opts.env_overrides)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(command)
+    }
+
+    fn args(&self, cmd: &[String], ws: &Path, opts: &SandboxRunOptions) -> Result<Vec<String>> {
+        #[cfg(target_os = "linux")]
+        writable::check_links(ws, &opts.extra_writable_paths)?;
+        #[cfg(runbay_native_linux)]
+        if self.backend == LinuxBackend::Landlock {
+            return native::arguments(cmd, ws, &self.pool_root, &self.forbidden_read_paths, opts);
+        }
+        self.build_bwrap_args(cmd, ws, opts)
     }
 
     /// Build the exact `bwrap` argument list (testable on all platforms!).
@@ -511,29 +607,13 @@ impl LinuxBubblewrapSandbox {
         allowed_workspace: &Path,
         opts: &SandboxRunOptions,
     ) -> Result<SandboxedChild> {
-        let Some(ref bwrap) = self.bwrap_bin else {
-            bail!("Linux bubblewrap (bwrap) is unavailable on this host");
-        };
-        if cmd.is_empty() {
-            bail!("sandbox command cannot be empty");
-        }
-
-        let ws_real =
-            fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
-        let args = self.build_bwrap_args(cmd, &ws_real, opts)?;
-
-        let mut command = tokio::process::Command::new(bwrap);
-        command.args(&args);
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        command.env_clear();
-        command.env("PATH", "/usr/local/bin:/usr/bin:/bin");
-        command.env("HOME", &ws_real);
-        command.env("PYTHONDONTWRITEBYTECODE", "1");
-        for (k, v) in &opts.env_overrides {
-            command.env(k, v);
-        }
+        let mut base = self.command(cmd, allowed_workspace, opts)?;
+        #[cfg(runbay_native_linux)]
+        let handshake = (self.backend == LinuxBackend::Landlock)
+            .then(|| native::Handshake::install(&mut base))
+            .transpose()?;
+        base.args(self.args(cmd, allowed_workspace, opts)?);
+        let mut command = tokio::process::Command::from(base);
         #[cfg(unix)]
         unsafe {
             command.pre_exec(|| {
@@ -549,9 +629,17 @@ impl LinuxBubblewrapSandbox {
             .as_ref()
             .map(|spec| RunCgroup::prepare(command.as_std_mut(), spec))
             .transpose()?;
-        let child = command
+        #[allow(unused_mut)]
+        let mut child = command
             .spawn()
-            .with_context(|| format!("failed to spawn bwrap sandboxed process {:?}", cmd))?;
+            .with_context(|| format!("failed to spawn Linux sandbox process {:?}", cmd))?;
+        #[cfg(runbay_native_linux)]
+        if let Some(channel) = handshake {
+            if let Err(error) = channel.wait() {
+                let _ = child.start_kill();
+                return Err(error);
+            }
+        }
         let pgid = child.id().map(|id| id as i32);
         Ok(SandboxedChild {
             child,
@@ -567,36 +655,31 @@ impl LinuxBubblewrapSandbox {
         allowed_workspace: &Path,
         opts: &SandboxRunOptions,
     ) -> Result<SandboxExecResult> {
-        let Some(ref bwrap) = self.bwrap_bin else {
-            bail!("Linux bubblewrap (bwrap) is unavailable on this host");
-        };
-        if cmd.is_empty() {
-            bail!("sandbox command cannot be empty");
-        }
-
-        let ws_real =
-            fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
-        let args = self.build_bwrap_args(cmd, &ws_real, opts)?;
-
-        let mut command = Command::new(bwrap);
-        command.args(&args);
-        command.env_clear();
-        command.env("PATH", "/usr/local/bin:/usr/bin:/bin");
-        command.env("HOME", &ws_real);
-        command.env("PYTHONDONTWRITEBYTECODE", "1");
-        for (k, v) in &opts.env_overrides {
-            command.env(k, v);
-        }
-
+        let mut command = self.command(cmd, allowed_workspace, opts)?;
+        #[cfg(runbay_native_linux)]
+        let handshake = (self.backend == LinuxBackend::Landlock)
+            .then(|| native::Handshake::install(&mut command))
+            .transpose()?;
+        command.args(self.args(cmd, allowed_workspace, opts)?);
         let t0 = Instant::now();
         let cgroup = opts
             .cgroup
             .as_ref()
             .map(|spec| RunCgroup::prepare(&mut command, spec))
             .transpose()?;
-        let output = command
-            .output()
-            .with_context(|| format!("failed to spawn bwrap sandboxed process {:?}", cmd))?;
+        #[allow(unused_mut)]
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn Linux sandbox process {:?}", cmd))?;
+        #[cfg(runbay_native_linux)]
+        if let Some(channel) = handshake {
+            if let Err(e) = channel.wait() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        }
+        let output = child.wait_with_output()?;
         if let Some(group) = cgroup {
             group.close()?;
         }
@@ -619,7 +702,7 @@ impl LinuxBubblewrapSandbox {
     }
 }
 
-/// Cross-platform OS sandbox facade auto-selecting macOS Seatbelt or Linux bubblewrap.
+/// Cross-platform OS sandbox facade selecting Seatbelt, bubblewrap, or Landlock + seccomp.
 pub enum LocalOsSandbox {
     MacOS(MacOSSeatbeltSandbox),
     Linux(LinuxBubblewrapSandbox),
@@ -630,7 +713,7 @@ impl LocalOsSandbox {
         if cfg!(target_os = "macos") {
             Self::MacOS(MacOSSeatbeltSandbox::new(pool_root, forbidden_read_paths))
         } else {
-            Self::Linux(LinuxBubblewrapSandbox::new(pool_root, forbidden_read_paths))
+            Self::Linux(LinuxSandbox::selected(pool_root, forbidden_read_paths))
         }
     }
 
@@ -641,9 +724,24 @@ impl LocalOsSandbox {
         }
     }
 
+    pub fn gateway_transport(&self) -> &'static str {
+        match self {
+            Self::MacOS(_) => "macos_seatbelt_loopback_tcp",
+            Self::Linux(s) if s.backend == LinuxBackend::Landlock => {
+                "linux_landlock_seccomp_unix_socket"
+            }
+            Self::Linux(s) if s.backend == LinuxBackend::Bubblewrap => {
+                "linux_bwrap_unshare_net_unix_socket"
+            }
+            Self::Linux(_) => "unavailable",
+        }
+    }
+
     pub fn mechanism_name(&self) -> &'static str {
         match self {
             Self::MacOS(_) => "macOS Seatbelt (sandbox-exec) global deny file-write* + pool/secret read-deny + workspace allowlist",
+            Self::Linux(s) if s.backend == LinuxBackend::Landlock => "Linux Landlock + seccomp-BPF, private mount/PID/network namespaces",
+            Self::Linux(s) if s.backend == LinuxBackend::Invalid => "unknown RUNBAY_SANDBOX_BACKEND",
             Self::Linux(_) => "Linux bubblewrap (bwrap) global --ro-bind / + tmpfs pool/secret masking + workspace --bind + --unshare-net",
         }
     }
@@ -725,7 +823,7 @@ pub struct SandboxVerificationReport {
     pub overhead_benchmark: SandboxOverheadReport,
 }
 
-/// Execute real OS child processes under the host sandbox (macOS Seatbelt or Linux bwrap)
+/// Execute real OS child processes under the selected host sandbox
 /// to prove all 7 kernel isolation invariants, including arbitrary outside-workspace host writes.
 pub fn run_os_sandbox_verification_suite(base_dir: &Path) -> Result<SandboxVerificationReport> {
     if base_dir.exists() {
@@ -1088,7 +1186,7 @@ mod tests {
             .unwrap();
 
         // Confirm grandchild is dead (ESRCH) on macOS where PID namespace is shared;
-        // on Linux bwrap --unshare-pid the PID inside the namespace is torn down with bwrap.
+        // on Linux the private PID namespace is torn down with its init process.
         #[cfg(target_os = "macos")]
         {
             tokio::time::sleep(Duration::from_millis(50)).await;

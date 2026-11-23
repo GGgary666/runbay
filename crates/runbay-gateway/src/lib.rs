@@ -1193,9 +1193,15 @@ mod tests {
                     ..Default::default()
                 },
                 r#"python3 -c '
-import os, socket
+import errno, os, socket
 for address in [("127.0.0.1", int(os.environ["HOST_GATEWAY_PORT"])), ("1.1.1.1", 443)]:
-    with socket.socket() as connection:
+    try:
+        connection = socket.socket()
+    except OSError as e:
+        if e.errno in (errno.EAFNOSUPPORT, errno.EPERM):
+            continue
+        raise
+    with connection:
         connection.settimeout(1)
         if connection.connect_ex(address) == 0:
             raise SystemExit(f"unexpected TCP connection to {address}")

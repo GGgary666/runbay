@@ -1001,11 +1001,13 @@ name = "runbay-sandbox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "libc",
  "parking_lot",
  "serde",
  "tempfile",
  "tokio",
+ "walkdir",
 ]
 
 [[package]]
