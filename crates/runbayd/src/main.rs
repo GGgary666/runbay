@@ -262,24 +262,20 @@ async fn run_self_check() -> Result<()> {
         false
     };
 
+    let mvcc_ok = rev0_future.hits.is_empty() && !rev1_new.hits.is_empty();
+    let cancel_ok = sink.accepted_count() == 1 && sink.rejected_late_count() == 1;
     let summary = serde_json::json!({
         "runbayd_version": env!("CARGO_PKG_VERSION"),
-        "mvcc_isolation_ok": rev0_future.hits.is_empty() && !rev1_new.hits.is_empty(),
+        "mvcc_isolation_ok": mvcc_ok,
         "incremental_equals_full": eq.exact_equivalence,
-        "cancel_guard_ok": sink.accepted_count() == 1 && sink.rejected_late_count() == 1,
+        "cancel_guard_ok": cancel_ok,
         "secretless_gateway_ok": gw_ok,
         "sandbox_mechanism": probe_sb.mechanism_name(),
         "os_sandbox_ok": sb_ok
     });
     println!("{}", serde_json::to_string_pretty(&summary)?);
     anyhow::ensure!(
-        sb_ok
-            && gw_ok
-            && eq.exact_equivalence
-            && rev0_future.hits.is_empty()
-            && !rev1_new.hits.is_empty()
-            && sink.accepted_count() == 1
-            && sink.rejected_late_count() == 1,
+        sb_ok && gw_ok && eq.exact_equivalence && mvcc_ok && cancel_ok,
         "runbayd self-check failed"
     );
     Ok(())

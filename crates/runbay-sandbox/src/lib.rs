@@ -10,6 +10,9 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -102,9 +105,114 @@ impl SandboxedChild {
     }
 }
 
+/// Owns the launcher and the resources that must survive until the worker starts.
+struct SandboxCommand<'a> {
+    command: Command,
+    argv: &'a [String],
+    cgroup_spec: Option<&'a SandboxCgroup>,
+    profile: Option<NamedTempFile>,
+    #[cfg(runbay_native_linux)]
+    handshake: Option<native::Handshake>,
+}
+
+impl<'a> SandboxCommand<'a> {
+    fn new(
+        binary: &Path,
+        argv: &'a [String],
+        workspace: &Path,
+        search_path: &str,
+        opts: &'a SandboxRunOptions,
+    ) -> Self {
+        let mut command = Command::new(binary);
+        command
+            .env_clear()
+            .env("PATH", search_path)
+            .env("HOME", workspace)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .envs(&opts.env_overrides)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Self {
+            command,
+            argv,
+            cgroup_spec: opts.cgroup.as_ref(),
+            profile: None,
+            #[cfg(runbay_native_linux)]
+            handshake: None,
+        }
+    }
+
+    fn attach_cgroup(&mut self) -> Result<Option<RunCgroup>> {
+        self.cgroup_spec
+            .map(|spec| RunCgroup::prepare(&mut self.command, spec))
+            .transpose()
+    }
+
+    fn spawn_async(mut self) -> Result<SandboxedChild> {
+        #[cfg(unix)]
+        self.command.process_group(0);
+        let cgroup = self.attach_cgroup()?;
+        #[allow(unused_mut)]
+        let mut child = tokio::process::Command::from(self.command)
+            .spawn()
+            .with_context(|| format!("failed to spawn sandboxed process {:?}", self.argv))?;
+        #[cfg(runbay_native_linux)]
+        if let Some(channel) = self.handshake {
+            if let Err(error) = channel.wait() {
+                let _ = child.start_kill();
+                return Err(error);
+            }
+        }
+        Ok(SandboxedChild {
+            pgid: child.id().map(|id| id as i32),
+            child,
+            _profile_guard: self.profile,
+            cgroup,
+        })
+    }
+
+    fn run(mut self) -> Result<SandboxExecResult> {
+        let start = Instant::now();
+        let cgroup = self.attach_cgroup()?;
+        #[allow(unused_mut)]
+        let mut child = self
+            .command
+            .spawn()
+            .with_context(|| format!("failed to spawn sandboxed process {:?}", self.argv))?;
+        #[cfg(runbay_native_linux)]
+        if let Some(channel) = self.handshake {
+            if let Err(error) = channel.wait() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+        let output = child.wait_with_output()?;
+        if let Some(group) = cgroup {
+            group.close()?;
+        }
+        let elapsed_ms = (start.elapsed().as_secs_f64() * 1_000_000.0).round() / 1000.0;
+        let returncode = output.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        Ok(SandboxExecResult {
+            command: self.argv.to_vec(),
+            returncode,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            kernel_denied: detect_kernel_denial(returncode, &stderr),
+            stderr,
+            elapsed_ms,
+            sandbox_enforced: true,
+        })
+    }
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+}
+
 fn sb_escape(path: &Path) -> String {
-    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    resolved
+    canonical_or_original(path)
         .to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -138,11 +246,10 @@ pub struct MacOSSeatbeltSandbox {
 
 impl MacOSSeatbeltSandbox {
     pub fn new(pool_root: impl AsRef<Path>, forbidden_read_paths: &[PathBuf]) -> Self {
-        let pool_root = fs::canonicalize(pool_root.as_ref())
-            .unwrap_or_else(|_| pool_root.as_ref().to_path_buf());
+        let pool_root = canonical_or_original(pool_root.as_ref());
         let forbidden = forbidden_read_paths
             .iter()
-            .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+            .map(|p| canonical_or_original(p))
             .collect();
         let bin = if cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists() {
             Some(PathBuf::from("/usr/bin/sandbox-exec"))
@@ -186,10 +293,10 @@ impl MacOSSeatbeltSandbox {
         // to this run's own allowed workspace / writable dirs so `realpath(3)` / `fs::canonicalize`
         // succeeds without exposing directory listing (`file-read-data`) or sibling slots.
         let mut metadata_ancestors: Vec<PathBuf> = Vec::new();
-        let ws_real_path =
-            fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
-        for target in std::iter::once(&ws_real_path).chain(opts.extra_writable_paths.iter()) {
-            let target_real = fs::canonicalize(target).unwrap_or_else(|_| target.clone());
+        for target in std::iter::once(allowed_workspace)
+            .chain(opts.extra_writable_paths.iter().map(PathBuf::as_path))
+        {
+            let target_real = canonical_or_original(target);
             if target_real.starts_with(&self.pool_root) {
                 let mut cur = target_real.parent();
                 while let Some(anc) = cur {
@@ -247,66 +354,50 @@ impl MacOSSeatbeltSandbox {
         lines.join("\n") + "\n"
     }
 
+    fn prepare<'a>(
+        &self,
+        cmd: &'a [String],
+        workspace: &Path,
+        opts: &'a SandboxRunOptions,
+        search_path: &str,
+    ) -> Result<SandboxCommand<'a>> {
+        let binary = self
+            .sandbox_exec_bin
+            .as_ref()
+            .context("macOS sandbox-exec is unavailable on this host")?;
+        if cmd.is_empty() {
+            bail!("sandbox command cannot be empty");
+        }
+        if opts.cgroup.is_some() {
+            bail!("sandbox cgroup limits require Linux");
+        }
+        let mut profile = tempfile::Builder::new().suffix(".sb").tempfile()?;
+        profile.write_all(self.build_profile(workspace, opts).as_bytes())?;
+        let workspace = canonical_or_original(workspace);
+        let mut launch = SandboxCommand::new(binary, cmd, &workspace, search_path, opts);
+        launch
+            .command
+            .arg("-f")
+            .arg(profile.path())
+            .args(cmd)
+            .current_dir(workspace);
+        launch.profile = Some(profile);
+        Ok(launch)
+    }
+
     pub fn spawn_async(
         &self,
         cmd: &[String],
         allowed_workspace: &Path,
         opts: &SandboxRunOptions,
     ) -> Result<SandboxedChild> {
-        let Some(ref sb_bin) = self.sandbox_exec_bin else {
-            bail!("macOS sandbox-exec is unavailable on this host");
-        };
-        if cmd.is_empty() {
-            bail!("sandbox command cannot be empty");
-        }
-
-        if opts.cgroup.is_some() {
-            bail!("sandbox cgroup limits require Linux");
-        }
-        let profile_text = self.build_profile(allowed_workspace, opts);
-        let ws_real =
-            fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
-
-        let mut tf = tempfile::Builder::new().suffix(".sb").tempfile()?;
-        std::io::Write::write_all(&mut tf, profile_text.as_bytes())?;
-        let profile_path = tf.path().to_path_buf();
-
-        let mut command = tokio::process::Command::new(sb_bin);
-        command.arg("-f").arg(&profile_path);
-        for arg in cmd {
-            command.arg(arg);
-        }
-        command.current_dir(&ws_real);
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        command.env_clear();
-        command.env("PATH", "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin");
-        command.env("HOME", &ws_real);
-        command.env("PYTHONDONTWRITEBYTECODE", "1");
-        for (k, v) in &opts.env_overrides {
-            command.env(k, v);
-        }
-        #[cfg(unix)]
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        let child = command
-            .spawn()
-            .with_context(|| format!("failed to spawn sandboxed process {:?}", cmd))?;
-        let pgid = child.id().map(|id| id as i32);
-        Ok(SandboxedChild {
-            child,
-            pgid,
-            _profile_guard: Some(tf),
-            cgroup: None,
-        })
+        self.prepare(
+            cmd,
+            allowed_workspace,
+            opts,
+            "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
+        )?
+        .spawn_async()
     }
 
     pub fn run(
@@ -315,58 +406,13 @@ impl MacOSSeatbeltSandbox {
         allowed_workspace: &Path,
         opts: &SandboxRunOptions,
     ) -> Result<SandboxExecResult> {
-        let Some(ref sb_bin) = self.sandbox_exec_bin else {
-            bail!("macOS sandbox-exec is unavailable on this host");
-        };
-        if cmd.is_empty() {
-            bail!("sandbox command cannot be empty");
-        }
-
-        if opts.cgroup.is_some() {
-            bail!("sandbox cgroup limits require Linux");
-        }
-        let profile_text = self.build_profile(allowed_workspace, opts);
-        let ws_real =
-            fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
-
-        let mut tf = tempfile::Builder::new().suffix(".sb").tempfile()?;
-        std::io::Write::write_all(&mut tf, profile_text.as_bytes())?;
-        let profile_path = tf.path().to_path_buf();
-
-        let mut command = Command::new(sb_bin);
-        command.arg("-f").arg(&profile_path);
-        for arg in cmd {
-            command.arg(arg);
-        }
-        command.current_dir(&ws_real);
-        command.env_clear();
-        command.env("PATH", "/usr/bin:/bin:/opt/homebrew/bin");
-        command.env("HOME", &ws_real);
-        command.env("PYTHONDONTWRITEBYTECODE", "1");
-        for (k, v) in &opts.env_overrides {
-            command.env(k, v);
-        }
-
-        let t0 = Instant::now();
-        let output = command
-            .output()
-            .with_context(|| format!("failed to spawn sandboxed process {:?}", cmd))?;
-        let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-
-        let returncode = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let kernel_denied = detect_kernel_denial(returncode, &stderr);
-
-        Ok(SandboxExecResult {
-            command: cmd.to_vec(),
-            returncode,
-            stdout,
-            stderr,
-            elapsed_ms,
-            sandbox_enforced: true,
-            kernel_denied,
-        })
+        self.prepare(
+            cmd,
+            allowed_workspace,
+            opts,
+            "/usr/bin:/bin:/opt/homebrew/bin",
+        )?
+        .run()
     }
 }
 
@@ -397,11 +443,10 @@ pub type LinuxBubblewrapSandbox = LinuxSandbox;
 
 impl LinuxSandbox {
     pub fn new(pool_root: impl AsRef<Path>, forbidden_read_paths: &[PathBuf]) -> Self {
-        let pool_root = fs::canonicalize(pool_root.as_ref())
-            .unwrap_or_else(|_| pool_root.as_ref().to_path_buf());
+        let pool_root = canonical_or_original(pool_root.as_ref());
         let forbidden = forbidden_read_paths
             .iter()
-            .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+            .map(|p| canonical_or_original(p))
             .collect();
         let bin = if cfg!(target_os = "linux") {
             ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]
@@ -471,7 +516,12 @@ impl LinuxSandbox {
         sb
     }
 
-    fn command(&self, cmd: &[String], ws: &Path, opts: &SandboxRunOptions) -> Result<Command> {
+    fn prepare<'a>(
+        &self,
+        cmd: &'a [String],
+        ws: &Path,
+        opts: &'a SandboxRunOptions,
+    ) -> Result<SandboxCommand<'a>> {
         let binary = self
             .binary
             .as_ref()
@@ -479,27 +529,24 @@ impl LinuxSandbox {
         if cmd.is_empty() {
             bail!("sandbox command cannot be empty");
         }
-        let mut command = Command::new(binary);
-        command
-            .env_clear()
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("HOME", ws)
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .envs(&opts.env_overrides)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        Ok(command)
-    }
-
-    fn args(&self, cmd: &[String], ws: &Path, opts: &SandboxRunOptions) -> Result<Vec<String>> {
         #[cfg(target_os = "linux")]
         writable::check_links(ws, &opts.extra_writable_paths)?;
+
+        let mut launch = SandboxCommand::new(binary, cmd, ws, "/usr/local/bin:/usr/bin:/bin", opts);
         #[cfg(runbay_native_linux)]
         if self.backend == LinuxBackend::Landlock {
-            return native::arguments(cmd, ws, &self.pool_root, &self.forbidden_read_paths, opts);
+            launch.handshake = Some(native::Handshake::install(&mut launch.command)?);
+            launch.command.args(native::arguments(
+                cmd,
+                ws,
+                &self.pool_root,
+                &self.forbidden_read_paths,
+                opts,
+            )?);
+            return Ok(launch);
         }
-        self.build_bwrap_args(cmd, ws, opts)
+        launch.command.args(self.build_bwrap_args(cmd, ws, opts)?);
+        Ok(launch)
     }
 
     /// Build the exact `bwrap` argument list (testable on all platforms!).
@@ -524,9 +571,8 @@ impl LinuxSandbox {
             );
         }
 
-        let ws_real =
-            fs::canonicalize(allowed_workspace).unwrap_or_else(|_| allowed_workspace.to_path_buf());
-        let ws_s = ws_real.to_string_lossy().to_string();
+        let path_arg = |path: &Path| canonical_or_original(path).to_string_lossy().into_owned();
+        let ws = path_arg(allowed_workspace);
         let pool_s = self.pool_root.to_string_lossy().to_string();
 
         let mut args: Vec<String> = vec![
@@ -553,44 +599,24 @@ impl LinuxSandbox {
             .iter()
             .chain(opts.extra_forbidden_reads.iter())
         {
-            let real = fs::canonicalize(fpath).unwrap_or_else(|_| fpath.clone());
-            args.push("--tmpfs".into());
-            args.push(real.to_string_lossy().to_string());
+            args.extend(["--tmpfs".into(), path_arg(fpath)]);
         }
 
-        // Re-expose shared L0 layers read-only
-        for ro in &opts.extra_readonly_paths {
-            let real = fs::canonicalize(ro).unwrap_or_else(|_| ro.clone());
-            let s = real.to_string_lossy().to_string();
-            args.push("--ro-bind".into());
-            args.push(s.clone());
-            args.push(s);
+        // Restore the read-only layers first, then the writable paths, single socket and workspace.
+        let mut bind =
+            |flag: &str, path: String| args.extend([flag.to_owned(), path.clone(), path]);
+        for path in &opts.extra_readonly_paths {
+            bind("--ro-bind", path_arg(path));
         }
-
-        // Re-expose explicitly scoped per-agent writable paths (e.g., isolated agent home)
-        for rw in &opts.extra_writable_paths {
-            let real = fs::canonicalize(rw).unwrap_or_else(|_| rw.clone());
-            let s = real.to_string_lossy().to_string();
-            args.push("--bind".into());
-            args.push(s.clone());
-            args.push(s);
+        for path in opts
+            .extra_writable_paths
+            .iter()
+            .chain(&opts.gateway_unix_socket)
+        {
+            bind("--bind", path_arg(path));
         }
-
-        // Bind-mount ONLY the single gateway Unix domain socket while keeping --unshare-net
-        if let Some(ref sock) = opts.gateway_unix_socket {
-            let real = fs::canonicalize(sock).unwrap_or_else(|_| sock.clone());
-            let s = real.to_string_lossy().to_string();
-            args.push("--bind".into());
-            args.push(s.clone());
-            args.push(s);
-        }
-
-        // Re-expose ONLY this run's isolated workspace read-write
-        args.push("--bind".into());
-        args.push(ws_s.clone());
-        args.push(ws_s.clone());
-        args.push("--chdir".into());
-        args.push(ws_s);
+        bind("--bind", ws.clone());
+        args.extend(["--chdir".into(), ws]);
 
         if !opts.allow_network {
             args.push("--unshare-net".into());
@@ -607,46 +633,7 @@ impl LinuxSandbox {
         allowed_workspace: &Path,
         opts: &SandboxRunOptions,
     ) -> Result<SandboxedChild> {
-        let mut base = self.command(cmd, allowed_workspace, opts)?;
-        #[cfg(runbay_native_linux)]
-        let handshake = (self.backend == LinuxBackend::Landlock)
-            .then(|| native::Handshake::install(&mut base))
-            .transpose()?;
-        base.args(self.args(cmd, allowed_workspace, opts)?);
-        let mut command = tokio::process::Command::from(base);
-        #[cfg(unix)]
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        let cgroup = opts
-            .cgroup
-            .as_ref()
-            .map(|spec| RunCgroup::prepare(command.as_std_mut(), spec))
-            .transpose()?;
-        #[allow(unused_mut)]
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("failed to spawn Linux sandbox process {:?}", cmd))?;
-        #[cfg(runbay_native_linux)]
-        if let Some(channel) = handshake {
-            if let Err(error) = channel.wait() {
-                let _ = child.start_kill();
-                return Err(error);
-            }
-        }
-        let pgid = child.id().map(|id| id as i32);
-        Ok(SandboxedChild {
-            child,
-            pgid,
-            _profile_guard: None,
-            cgroup,
-        })
+        self.prepare(cmd, allowed_workspace, opts)?.spawn_async()
     }
 
     pub fn run(
@@ -655,50 +642,7 @@ impl LinuxSandbox {
         allowed_workspace: &Path,
         opts: &SandboxRunOptions,
     ) -> Result<SandboxExecResult> {
-        let mut command = self.command(cmd, allowed_workspace, opts)?;
-        #[cfg(runbay_native_linux)]
-        let handshake = (self.backend == LinuxBackend::Landlock)
-            .then(|| native::Handshake::install(&mut command))
-            .transpose()?;
-        command.args(self.args(cmd, allowed_workspace, opts)?);
-        let t0 = Instant::now();
-        let cgroup = opts
-            .cgroup
-            .as_ref()
-            .map(|spec| RunCgroup::prepare(&mut command, spec))
-            .transpose()?;
-        #[allow(unused_mut)]
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("failed to spawn Linux sandbox process {:?}", cmd))?;
-        #[cfg(runbay_native_linux)]
-        if let Some(channel) = handshake {
-            if let Err(e) = channel.wait() {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(e);
-            }
-        }
-        let output = child.wait_with_output()?;
-        if let Some(group) = cgroup {
-            group.close()?;
-        }
-        let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-
-        let returncode = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let kernel_denied = detect_kernel_denial(returncode, &stderr);
-
-        Ok(SandboxExecResult {
-            command: cmd.to_vec(),
-            returncode,
-            stdout,
-            stderr,
-            elapsed_ms,
-            sandbox_enforced: true,
-            kernel_denied,
-        })
+        self.prepare(cmd, allowed_workspace, opts)?.run()
     }
 }
 
@@ -863,93 +807,51 @@ pub fn run_os_sandbox_verification_suite(base_dir: &Path) -> Result<SandboxVerif
         ..Default::default()
     };
 
-    // 1. Allowed workspace read/write + shared L0 RO read
-    let r_allow = sb.run(
-        &[
+    let read_file = |path: &Path| {
+        sb.run(
+            &["/bin/cat".into(), path.to_string_lossy().into_owned()],
+            &run2_ws,
+            &ro_opts,
+        )
+    };
+    let run_shell = |script: &str, files: &[&Path]| {
+        let mut cmd = vec![
             "/bin/sh".into(),
             "-c".into(),
-            format!(
-                "cat \"{}/task.txt\" && cat \"{}/shared_lib.txt\" && echo ok > \"{}/out.txt\"",
-                run2_ws.display(),
-                l0_ro.display(),
-                run2_ws.display()
-            ),
-        ],
-        &run2_ws,
-        &ro_opts,
-    )?;
+            script.into(),
+            "runbay-check".into(),
+        ];
+        cmd.extend(files.iter().map(|path| path.to_string_lossy().into_owned()));
+        sb.run(&cmd, &run2_ws, &ro_opts)
+    };
 
-    // 2. Host secret read blocked
-    let r_host_secret = sb.run(
-        &[
-            "/bin/cat".into(),
-            secret_dir.join("host_canary.txt").to_string_lossy().into(),
-        ],
-        &run2_ws,
-        &ro_opts,
-    )?;
-
-    // 3. Sibling run private canary blocked
-    let r_prev_canary = sb.run(
-        &[
-            "/bin/cat".into(),
-            run1_ws.join("private_canary.txt").to_string_lossy().into(),
-        ],
-        &run2_ws,
-        &ro_opts,
-    )?;
-
-    // 4. Symlink escape blocked
-    let r_symlink = sb.run(
-        &["/bin/cat".into(), escape_link.to_string_lossy().into()],
-        &run2_ws,
-        &ro_opts,
-    )?;
-
-    // 5. L0 RO tamper write blocked
-    let r_l0_write = sb.run(
-        &[
-            "/bin/sh".into(),
-            "-c".into(),
-            format!("echo pwned > \"{}/tamper.txt\"", l0_ro.display()),
-        ],
-        &run2_ws,
-        &ro_opts,
-    )?;
-
-    // 6. Arbitrary outside-workspace host write blocked (not under pool_root or secret_dir!)
+    let task_path = run2_ws.join("task.txt");
+    let tamper_target = l0_ro.join("tamper.txt");
     let outside_target = unrelated_host_dir.join("arbitrary_escape_write.txt");
-    let r_arbitrary_write = sb.run(
+    let r_allow = run_shell(
+        r#"cat "$1" && cat "$2" && echo ok > "$3""#,
         &[
-            "/bin/sh".into(),
-            "-c".into(),
-            format!("echo escaped > \"{}\"", outside_target.display()),
+            &task_path,
+            &l0_ro.join("shared_lib.txt"),
+            &run2_ws.join("out.txt"),
         ],
-        &run2_ws,
-        &ro_opts,
     )?;
-
-    // 7. Outbound internet blocked
-    let r_net = sb.run(
-        &[
-            "/bin/sh".into(),
-            "-c".into(),
-            "curl -sS --max-time 2 https://1.1.1.1".into(),
-        ],
-        &run2_ws,
-        &ro_opts,
-    )?;
+    let r_host_secret = read_file(&secret_dir.join("host_canary.txt"))?;
+    let r_prev_canary = read_file(&run1_ws.join("private_canary.txt"))?;
+    let r_symlink = read_file(&escape_link)?;
+    let r_l0_write = run_shell(r#"echo pwned > "$1""#, &[&tamper_target])?;
+    let r_arbitrary_write = run_shell(r#"echo escaped > "$1""#, &[&outside_target])?;
+    let r_net = run_shell("curl -sS --max-time 2 https://1.1.1.1", &[])?;
 
     // Bare vs sandboxed subprocess overhead (10 trials)
     let mut bare_ms = Vec::with_capacity(10);
     let mut sb_ms = Vec::with_capacity(10);
-    let task_path = run2_ws.join("task.txt").to_string_lossy().to_string();
     for _ in 0..10 {
         let t0 = Instant::now();
         let _ = Command::new("/bin/cat").arg(&task_path).output()?;
         bare_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
 
-        let res = sb.run(&["/bin/cat".into(), task_path.clone()], &run2_ws, &ro_opts)?;
+        let res = read_file(&task_path)?;
         sb_ms.push(res.elapsed_ms);
     }
 
@@ -957,74 +859,54 @@ pub fn run_os_sandbox_verification_suite(base_dir: &Path) -> Result<SandboxVerif
     let sb_mean = ((sb_ms.iter().sum::<f64>() / sb_ms.len() as f64) * 100.0).round() / 100.0;
     let added = ((sb_mean - bare_mean) * 100.0).round() / 100.0;
 
-    let all_passed = r_allow.returncode == 0
-        && r_allow.stdout.contains("RUN2_ALLOWED_TASK_INPUT")
-        && r_allow.stdout.contains("SHARED_READONLY_L0_DATA")
-        && r_host_secret.kernel_denied
-        && !r_host_secret.stdout.contains("HOST_SECRET_CANARY_999")
-        && r_prev_canary.kernel_denied
-        && !r_prev_canary.stdout.contains("RUN1_PRIVATE_CANARY_ABC")
-        && r_symlink.kernel_denied
-        && !r_symlink.stdout.contains("HOST_SECRET_CANARY_999")
-        && r_l0_write.kernel_denied
-        && !l0_ro.join("tamper.txt").exists()
-        && r_arbitrary_write.kernel_denied
-        && !outside_target.exists()
-        && r_net.returncode != 0;
-
     let base_prefix = base_real.to_string_lossy().to_string();
     let redact = |s: &str| s.trim().replace(&base_prefix, "<SANDBOX_TMP>");
+
+    let denied = |result: &SandboxExecResult, canary_protected: bool| SandboxCheckOutcome {
+        passed: result.kernel_denied && canary_protected,
+        elapsed_ms: None,
+        stderr: Some(redact(&result.stderr)),
+    };
 
     let mut checks = BTreeMap::new();
     checks.insert(
         "allowed_workspace_and_l0_ro".into(),
         SandboxCheckOutcome {
-            passed: r_allow.returncode == 0,
+            passed: r_allow.returncode == 0
+                && r_allow.stdout.contains("RUN2_ALLOWED_TASK_INPUT")
+                && r_allow.stdout.contains("SHARED_READONLY_L0_DATA"),
             elapsed_ms: Some(r_allow.elapsed_ms),
             stderr: None,
         },
     );
     checks.insert(
         "block_host_secret_read".into(),
-        SandboxCheckOutcome {
-            passed: r_host_secret.kernel_denied
-                && !r_host_secret.stdout.contains("HOST_SECRET_CANARY_999"),
-            elapsed_ms: None,
-            stderr: Some(redact(&r_host_secret.stderr)),
-        },
+        denied(
+            &r_host_secret,
+            !r_host_secret.stdout.contains("HOST_SECRET_CANARY_999"),
+        ),
     );
     checks.insert(
         "block_prev_run_private_canary".into(),
-        SandboxCheckOutcome {
-            passed: r_prev_canary.kernel_denied
-                && !r_prev_canary.stdout.contains("RUN1_PRIVATE_CANARY_ABC"),
-            elapsed_ms: None,
-            stderr: Some(redact(&r_prev_canary.stderr)),
-        },
+        denied(
+            &r_prev_canary,
+            !r_prev_canary.stdout.contains("RUN1_PRIVATE_CANARY_ABC"),
+        ),
     );
     checks.insert(
         "block_symlink_escape".into(),
-        SandboxCheckOutcome {
-            passed: r_symlink.kernel_denied && !r_symlink.stdout.contains("HOST_SECRET_CANARY_999"),
-            elapsed_ms: None,
-            stderr: Some(redact(&r_symlink.stderr)),
-        },
+        denied(
+            &r_symlink,
+            !r_symlink.stdout.contains("HOST_SECRET_CANARY_999"),
+        ),
     );
     checks.insert(
         "block_l0_tamper_write".into(),
-        SandboxCheckOutcome {
-            passed: r_l0_write.kernel_denied && !l0_ro.join("tamper.txt").exists(),
-            elapsed_ms: None,
-            stderr: Some(redact(&r_l0_write.stderr)),
-        },
+        denied(&r_l0_write, !tamper_target.exists()),
     );
     checks.insert(
         "block_arbitrary_outside_host_write".into(),
-        SandboxCheckOutcome {
-            passed: r_arbitrary_write.kernel_denied && !outside_target.exists(),
-            elapsed_ms: None,
-            stderr: Some(redact(&r_arbitrary_write.stderr)),
-        },
+        denied(&r_arbitrary_write, !outside_target.exists()),
     );
     checks.insert(
         "block_outbound_network".into(),
@@ -1039,7 +921,7 @@ pub fn run_os_sandbox_verification_suite(base_dir: &Path) -> Result<SandboxVerif
         measurement_type: "real_os_kernel_exec".into(),
         platform: format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH),
         sandbox_mechanism: sb.mechanism_name().into(),
-        all_invariants_passed: all_passed,
+        all_invariants_passed: checks.values().all(|check| check.passed),
         checks,
         overhead_benchmark: SandboxOverheadReport {
             bare_exec_mean_ms: bare_mean,
@@ -1147,6 +1029,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_worker_environment_and_output_on_both_entry_points() {
+        let pool = TempDir::new().unwrap();
+        let ws = pool.path().join("workspace");
+        fs::create_dir(&ws).unwrap();
+        let sandbox = LocalOsSandbox::new(pool.path(), &[]);
+        if !sandbox.is_available() {
+            return;
+        }
+        let opts = SandboxRunOptions {
+            env_overrides: [("MARKER".into(), "worker".into())].into(),
+            ..Default::default()
+        };
+        let cmd = [
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"test "$PWD" = "$HOME" && printf %s "$PATH" && printf %s "$MARKER" >&2"#.into(),
+        ];
+        let direct = sandbox.run(&cmd, &ws, &opts).unwrap();
+        let child = sandbox.spawn_async(&cmd, &ws, &opts).unwrap();
+        let output = child.child.wait_with_output().await.unwrap();
+        let (direct_path, async_path) = if cfg!(target_os = "macos") {
+            (
+                "/usr/bin:/bin:/opt/homebrew/bin",
+                "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
+            )
+        } else {
+            let linux_path = "/usr/local/bin:/usr/bin:/bin";
+            (linux_path, linux_path)
+        };
+        assert_eq!(direct.returncode, 0, "{}", direct.stderr);
+        assert_eq!(direct.stdout, direct_path);
+        assert_eq!(direct.stderr, "worker");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, async_path.as_bytes());
+        assert_eq!(output.stderr, b"worker");
+    }
+
+    #[tokio::test]
     async fn test_async_process_group_termination_reaps_grandchild() {
         let tmp = TempDir::new().unwrap();
         let pool = tmp.path().join("pool");
@@ -1166,6 +1086,11 @@ mod tests {
                 &SandboxRunOptions::default(),
             )
             .unwrap();
+
+        let pid = child.pid().unwrap() as i32;
+        // The host must be able to address the entire sandbox by the launcher's PID.
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+        assert_eq!(child.pgid(), Some(pid));
 
         // Wait until grandchild PID is written
         let mut gpid: Option<i32> = None;
@@ -1209,7 +1134,8 @@ mod tests {
         if !sb.is_available() {
             return;
         }
-        let report = run_os_sandbox_verification_suite(&tmp.path().join("sb")).unwrap();
+        let report =
+            run_os_sandbox_verification_suite(&tmp.path().join(r#"suite with "quotes""#)).unwrap();
         assert!(
             report.all_invariants_passed,
             "OS sandbox suite failed: {:?}",
