@@ -26,24 +26,48 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install Linux sandbox tooling and scoped user-namespace policies
-        if: runner.os == 'Linux'
+      - name: Install and verify bubblewrap
+        if: matrix.backend == 'bwrap'
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap curl apparmor-profiles
-          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" = 1 ]; then
-            sudo apparmor_parser -r /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          sudo apt-get install -y bubblewrap curl apparmor apparmor-profiles
+          probe=(bwrap --unshare-net --unshare-pid --ro-bind / / -- /bin/true)
+          if ! "${probe[@]}"; then
+            for profile in /etc/apparmor.d/{bwrap-userns-restrict,bwrap,bubblewrap} \
+                           /usr/share/apparmor/extra-profiles/{bwrap-userns-restrict,bwrap,bubblewrap}; do
+              if [[ -f "$profile" ]]; then
+                sudo apparmor_parser -r "$profile"
+                break
+              fi
+            done
+            "${probe[@]}"
           fi
+
+      - name: Install the scoped Landlock launcher
+        if: matrix.backend == 'landlock'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl apparmor
           sudo sh scripts/install-linux-launcher.sh
+
+      - name: Cache the pinned Ubuntu 5.13 kernel package
+        if: matrix.backend == 'landlock'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kernel-5.13.deb
+          key: ubuntu-kernel-eca13c306042c2798cf46849a7bc6633354572f549ecafc44c4a572ab5ac2540
 
       - name: Boot the minimum Linux kernel with the native launcher
         if: matrix.backend == 'landlock'
         run: |
           sudo apt-get install -y --no-install-recommends qemu-system-x86 cpio
           deb="$RUNNER_TEMP/kernel-5.13.deb"
-          curl --fail --location --retry 3 --output "$deb" \
-            https://old-releases.ubuntu.com/ubuntu/pool/main/l/linux-signed/linux-image-5.13.0-19-generic_5.13.0-19.19_amd64.deb
-          echo "eca13c306042c2798cf46849a7bc6633354572f549ecafc44c4a572ab5ac2540  $deb" | sha256sum -c -
+          checksum="eca13c306042c2798cf46849a7bc6633354572f549ecafc44c4a572ab5ac2540  $deb"
+          if ! echo "$checksum" | sha256sum --check --status; then
+            curl --fail --location --retry 3 --output "$deb" \
+              https://old-releases.ubuntu.com/ubuntu/pool/main/l/linux-signed/linux-image-5.13.0-19-generic_5.13.0-19.19_amd64.deb
+          fi
+          echo "$checksum" | sha256sum --check
           dpkg-deb -x "$deb" "$RUNNER_TEMP/linux-5.13"
           KERNEL_CC=cc KERNEL_IMAGE="$RUNNER_TEMP/linux-5.13/boot/vmlinuz-5.13.0-19-generic" \
             sh scripts/test-linux-5.13.sh
