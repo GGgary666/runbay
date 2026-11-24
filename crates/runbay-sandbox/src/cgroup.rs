@@ -44,7 +44,7 @@ pub struct SandboxCgroup {
 /// An administrator supplies a cgroup v2 subtree delegated to the daemon.
 /// Runbay only creates leaves inside it and never enables controllers on host ancestors.
 #[cfg(target_os = "linux")]
-pub fn validate_cgroup_parent(parent: &Path) -> Result<()> {
+fn check_controllers(parent: &Path) -> Result<()> {
     use std::os::fd::AsRawFd;
     let dir = fs::File::open(parent).context("open delegated cgroup directory")?;
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -65,6 +65,36 @@ pub fn validate_cgroup_parent(parent: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn validate_cgroup_parent(parent: &Path) -> Result<()> {
+    check_controllers(parent)?;
+    // A fresh child has the same permissions and controller files a real run will get.
+    let path = tempfile::Builder::new()
+        .prefix(".runbay-probe-")
+        .tempdir_in(parent)
+        .context("create a leaf in the delegated cgroup")?
+        .keep();
+    let group = RunCgroup {
+        path,
+        removed: false,
+    };
+    for name in [
+        "cpu.max",
+        "pids.max",
+        "memory.max",
+        "memory.swap.max",
+        "memory.oom.group",
+        "cgroup.kill",
+        "cgroup.procs",
+    ] {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(group.path.join(name))
+            .with_context(|| format!("delegated cgroup requires writable {name}"))?;
+    }
+    group.close()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -115,6 +145,9 @@ impl RunCgroup {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
 
+        #[cfg(target_os = "linux")]
+        check_controllers(&spec.parent)?;
+        #[cfg(not(target_os = "linux"))]
         validate_cgroup_parent(&spec.parent)?;
         let path = leaf_path(&spec.parent, &spec.run_id)?;
         fs::create_dir(&path).with_context(|| format!("create cgroup {}", path.display()))?;
@@ -155,6 +188,18 @@ impl RunCgroup {
             });
         }
         Ok(group)
+    }
+
+    pub(crate) fn close_with_oom(self) -> Result<bool> {
+        let events = fs::read_to_string(self.path.join("memory.events"));
+        self.close()?;
+        let events = events.context("read sandbox memory.events")?;
+        let count = events
+            .lines()
+            .find_map(|line| line.strip_prefix("oom_kill "))
+            .context("missing oom_kill in memory.events")?
+            .parse::<u64>()?;
+        Ok(count > 0)
     }
 
     pub(crate) fn close(mut self) -> Result<()> {

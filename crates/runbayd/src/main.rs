@@ -1,6 +1,5 @@
 mod adapters;
 mod auth;
-mod cowiki;
 mod fixture_worker;
 mod models;
 mod server;
@@ -25,8 +24,6 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
         Some("__internal-fixture-worker") => fixture_worker::run_fixture_worker().await,
-        #[cfg(target_os = "linux")]
-        Some("__internal-cowiki-worker") => cowiki::run_worker().await,
         Some("self-check") => run_self_check().await,
         Some("serve") => {
             let config = parse_serve_args(&args[1..])?;
@@ -56,8 +53,7 @@ async fn main() -> Result<()> {
                    --sandbox-max-pids <N>             Per-run process/thread ceiling (default 64)\n\
                    --upstream-url <URL>               Upstream OpenAI-compatible URL for secretless gateway (uses env RUNBAY_UPSTREAM_API_KEY)\n\
                    --codex-bin <PATH>                 Explicit codex executable path\n\
-                   --enable-fixture-adapter           Opt-in: enable built-in deterministic protocol fixture adapter (for tests/CI)\n\
-                   --enable-cowiki-adapter            Opt-in: enable one-shot Markdown Q&A on Linux through the Unix socket gateway",
+                   --enable-fixture-adapter           Opt-in: enable built-in deterministic protocol fixture adapter (for tests/CI)",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())
@@ -74,7 +70,9 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
     let mut max_concurrent_runs: usize = 4;
     let mut max_queued_runs: usize = 32;
     let mut default_timeout_secs: u64 = 300;
-    let mut cgroup_root = std::env::var_os("RUNBAY_CGROUP_ROOT").map(PathBuf::from);
+    let mut cgroup_root = std::env::var_os("RUNBAY_CGROUP_ROOT")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
     let mut sandbox_limits = SandboxLimits::default();
     let mut limits_specified = false;
     let mut allowed_workspace_roots: Vec<PathBuf> = Vec::new();
@@ -85,7 +83,6 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
         .ok()
         .filter(|s| !s.trim().is_empty());
     let mut enable_fixture_adapter = false;
-    let mut enable_cowiki_adapter = false;
     let mut codex_bin: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -179,9 +176,6 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
             "--enable-fixture-adapter" => {
                 enable_fixture_adapter = true;
             }
-            "--enable-cowiki-adapter" => {
-                enable_cowiki_adapter = true;
-            }
             other => bail!("unknown serve flag: {other}"),
         }
         i += 1;
@@ -211,7 +205,6 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
         upstream_url,
         upstream_api_key,
         enable_fixture_adapter,
-        enable_cowiki_adapter,
         codex_bin,
     })
 }
@@ -256,10 +249,12 @@ async fn run_self_check() -> Result<()> {
     let gw_ok = resp.status().is_success();
 
     let probe_sb = LocalOsSandbox::new(tmp.path(), &[]);
-    let sb_ok = if probe_sb.is_available() {
-        run_os_sandbox_verification_suite(&tmp.path().join("sb"))?.all_invariants_passed
-    } else {
-        false
+    let sb_ok = match probe_sb.check_available() {
+        Ok(()) => run_os_sandbox_verification_suite(&tmp.path().join("sb"))?.all_invariants_passed,
+        Err(error) => {
+            eprintln!("{error:#}");
+            false
+        }
     };
 
     let mvcc_ok = rev0_future.hits.is_empty() && !rev1_new.hits.is_empty();

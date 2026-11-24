@@ -4,8 +4,7 @@ set -eu
 base=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
-cc -std=gnu11 -O2 -Wall -Wextra -Werror -static \
-    "$base/crates/runbay-sandbox/native/launcher.c" -o "$build/runbay-landlock"
+sh "$base/scripts/build-linux-launcher.sh" "$build/runbay-landlock"
 install -d -m 0755 /usr/local/libexec
 install -m 0755 "$build/runbay-landlock" /usr/local/libexec/runbay-landlock
 if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || true)" = 1 ]; then

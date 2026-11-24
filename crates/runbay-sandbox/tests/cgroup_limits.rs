@@ -117,7 +117,10 @@ finally:
             assert!(throttled > 0 && pid_denials > 0);
             println!("20% CPU / 8 tasks: cpu.stat nr_throttled={throttled}, pids.events max={pid_denials}");
         }
-        process.finish_resources().await.unwrap();
+        assert_eq!(
+            process.finish_resources_with_oom().await.unwrap(),
+            expect_oom
+        );
         assert!(!leaf.exists());
     }
 }

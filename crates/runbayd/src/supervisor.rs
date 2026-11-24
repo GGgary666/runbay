@@ -44,7 +44,6 @@ pub struct DaemonConfig {
     pub upstream_url: Option<String>,
     pub upstream_api_key: Option<String>,
     pub enable_fixture_adapter: bool,
-    pub enable_cowiki_adapter: bool,
     pub codex_bin: Option<PathBuf>,
 }
 
@@ -139,11 +138,7 @@ impl DaemonSupervisor {
             Ok(())
         })?;
 
-        let adapters = AdapterRegistry::build(
-            cfg.enable_fixture_adapter,
-            cfg.enable_cowiki_adapter,
-            cfg.codex_bin.clone(),
-        )?;
+        let adapters = AdapterRegistry::build(cfg.enable_fixture_adapter, cfg.codex_bin.clone())?;
 
         let (gateway, gateway_unix_socket) =
             if let (Some(url), Some(key)) = (&cfg.upstream_url, &cfg.upstream_api_key) {
@@ -187,8 +182,9 @@ impl DaemonSupervisor {
     pub fn status(&self) -> Result<DaemonStatusResponse> {
         let probe_sb = LocalOsSandbox::new(&self.config.state_dir, &[]);
         let agents = self.store.list_agents()?;
+        let available = probe_sb.is_available();
         let gw_transport = (self.gateway.is_some()
-            && probe_sb.is_available()
+            && available
             && (cfg!(target_os = "macos") || self.gateway_unix_socket.is_some()))
         .then(|| probe_sb.gateway_transport().to_owned());
         Ok(DaemonStatusResponse {
@@ -196,7 +192,7 @@ impl DaemonSupervisor {
             version: env!("CARGO_PKG_VERSION").to_string(),
             platform: format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH),
             sandbox_mechanism: probe_sb.mechanism_name().to_string(),
-            sandbox_available: probe_sb.is_available(),
+            sandbox_available: available,
             sandbox_resource_limits: self.config.cgroup_root.as_ref().map(|_| self.config.sandbox_limits),
             gateway_enabled: self.gateway.is_some(),
             gateway_transport: gw_transport,
@@ -805,25 +801,6 @@ impl DaemonSupervisor {
         // 4. Spawn real OS-sandboxed process in its own POSIX process group.
         let pool_root = self.config.state_dir.join("agents");
         let control_token_dir = self.config.state_dir.join("control");
-        let _ = fs::create_dir_all(&control_token_dir);
-        let sb = LocalOsSandbox::new(&pool_root, &[control_token_dir]);
-        if !sb.is_available() {
-            mvcc.abort_branch(&branch.branch_id, "sandbox_unavailable");
-            drop(gw_guard);
-            drop(lease);
-            drop(permit);
-            self.finalize_run(
-                &mut run,
-                &active,
-                &sink,
-                RunState::Failed,
-                None,
-                Some("sandbox_unavailable"),
-                Some("Requested OS sandbox is unavailable. Check RUNBAY_SANDBOX_BACKEND, user namespaces and launcher installation."),
-            );
-            return;
-        }
-
         let limits = req.resource_limits.unwrap_or(self.config.sandbox_limits);
         prepared.sandbox_opts.cgroup =
             self.config
@@ -834,14 +811,28 @@ impl DaemonSupervisor {
                     run_id: run.run_id.clone(),
                     limits,
                 });
-        let mut sandboxed = match sb.spawn_async(
-            &prepared.command,
-            &branch.workspace_dir,
-            &prepared.sandbox_opts,
-        ) {
-            Ok(child) => child,
-            Err(e) => {
-                mvcc.abort_branch(&branch.branch_id, "spawn_failed");
+        let workspace = branch.workspace_dir.clone();
+        let requested_limits = prepared
+            .sandbox_opts
+            .cgroup
+            .as_ref()
+            .map(|group| group.limits);
+        let launch = tokio::task::spawn_blocking(move || {
+            let sandbox = LocalOsSandbox::new(pool_root, &[control_token_dir]);
+            sandbox
+                .check_available()
+                .map_err(|e| ("sandbox_unavailable", e))?;
+            let child = sandbox
+                .spawn_async(&prepared.command, &workspace, &prepared.sandbox_opts)
+                .map_err(|e| ("spawn_failed", e))?;
+            Ok((child, sandbox.gateway_transport()))
+        })
+        .await
+        .unwrap_or_else(|e| Err(("spawn_failed", e.into())));
+        let (mut sandboxed, transport) = match launch {
+            Ok(value) => value,
+            Err((code, error)) => {
+                mvcc.abort_branch(&branch.branch_id, code);
                 drop(gw_guard);
                 drop(lease);
                 drop(permit);
@@ -851,8 +842,8 @@ impl DaemonSupervisor {
                     &sink,
                     RunState::Failed,
                     None,
-                    Some("spawn_failed"),
-                    Some(&e.to_string()),
+                    Some(code),
+                    Some(&format!("{error:#}")),
                 );
                 return;
             }
@@ -864,9 +855,7 @@ impl DaemonSupervisor {
         run.sandbox_enforced = true;
         run.network_isolated = prepared.network_isolated;
         run.secretless_gateway = prepared.secretless_gateway;
-        run.gateway_transport = prepared
-            .secretless_gateway
-            .then(|| sb.gateway_transport().to_owned());
+        run.gateway_transport = prepared.secretless_gateway.then(|| transport.to_owned());
         let _ = self.store.update_run(&run);
 
         self.emit_lifecycle_event(
@@ -879,7 +868,7 @@ impl DaemonSupervisor {
                 "pid": sandboxed.pid(),
                 "pgid": sandboxed.pgid(),
                 "workspace_rev": run.workspace_rev,
-                "resource_limits": prepared.sandbox_opts.cgroup.as_ref().map(|group| group.limits),
+                "resource_limits": requested_limits,
                 "sandbox_enforced": true,
                 "network_isolated": run.network_isolated,
                 "secretless_gateway": run.secretless_gateway,
@@ -969,7 +958,7 @@ impl DaemonSupervisor {
                 .await;
             Duration::from_millis(300)
         };
-        let cleanup = sandboxed.finish_resources().await;
+        let cleanup = sandboxed.finish_resources_with_oom().await;
         for handle in [stdout_handle, stderr_handle].into_iter().flatten() {
             let _ = tokio::time::timeout(drain_timeout, handle).await;
         }
@@ -984,10 +973,19 @@ impl DaemonSupervisor {
                     Some(format!("{error:#}")),
                 )
             }
-            (Ok(()), WaitOutcome::Exited(Ok(status))) if status.success() => {
+            (Ok(true), WaitOutcome::Exited(Ok(status))) => {
+                mvcc.abort_branch(&branch.branch_id, "oom_killed");
+                (
+                    RunState::Failed,
+                    status.code(),
+                    Some("oom_killed"),
+                    Some("The run exceeded its cgroup memory limit".to_owned()),
+                )
+            }
+            (Ok(_), WaitOutcome::Exited(Ok(status))) if status.success() => {
                 (RunState::Succeeded, status.code(), None, None)
             }
-            (Ok(()), WaitOutcome::Exited(Ok(status))) => {
+            (Ok(_), WaitOutcome::Exited(Ok(status))) => {
                 mvcc.abort_branch(&branch.branch_id, "nonzero_exit");
                 let code = status.code();
                 (
@@ -997,7 +995,7 @@ impl DaemonSupervisor {
                     Some(format!("Process exited with code {}", code.unwrap_or(-1))),
                 )
             }
-            (Ok(()), WaitOutcome::Exited(Err(error))) => {
+            (Ok(_), WaitOutcome::Exited(Err(error))) => {
                 mvcc.abort_branch(&branch.branch_id, "wait_error");
                 (
                     RunState::Failed,
@@ -1006,11 +1004,11 @@ impl DaemonSupervisor {
                     Some(error.to_string()),
                 )
             }
-            (Ok(()), WaitOutcome::Cancelled(reason)) => {
+            (Ok(_), WaitOutcome::Cancelled(reason)) => {
                 mvcc.abort_branch(&branch.branch_id, &reason);
                 (RunState::Cancelled, None, Some("cancelled"), Some(reason))
             }
-            (Ok(()), WaitOutcome::TimedOut) => {
+            (Ok(_), WaitOutcome::TimedOut) => {
                 mvcc.abort_branch(&branch.branch_id, "timeout");
                 (
                     RunState::Failed,

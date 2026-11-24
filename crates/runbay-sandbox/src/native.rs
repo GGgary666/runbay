@@ -10,13 +10,21 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(super) fn launcher() -> Option<PathBuf> {
-    // Installed location can have a narrowly scoped Ubuntu AppArmor userns profile.
+    if let Some(path) = std::env::var_os("RUNBAY_LANDLOCK_LAUNCHER") {
+        return Some(path.into());
+    }
+    let installed = Path::new("/usr/local/libexec/runbay-landlock");
+    let restricted = fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        .is_ok_and(|value| value.trim() == "1");
+    // Ubuntu attaches the user namespace profile to the root-owned installed path.
+    let built = option_env!("RUNBAY_BUILT_LAUNCHER").map(PathBuf::from);
     [
-        Some(PathBuf::from("/usr/local/libexec/runbay-landlock")),
+        restricted.then(|| installed.to_owned()),
+        built,
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("runbay-landlock"))),
-        Some(PathBuf::from(concat!(env!("OUT_DIR"), "/runbay-landlock"))),
+        Some(installed.to_owned()),
     ]
     .into_iter()
     .flatten()
@@ -72,7 +80,7 @@ pub(super) fn arguments(
             exposures.push(("--device", name.into()));
         }
     }
-    let ws = fs::canonicalize(workspace).context("resolve isolated workspace")?;
+    let ws = workspace.to_owned();
     exposures.push(("--workspace", ws.clone()));
     for (mode, paths) in [
         ("--ro", &opts.extra_readonly_paths),
@@ -113,7 +121,16 @@ pub(super) fn arguments(
         );
         exposures.push(("--ro", sock.clone()));
     }
-    let mut args = vec![];
+    exposures.sort_by(|(lm, left), (rm, right)| {
+        left.cmp(right)
+            .then_with(|| (*rm == "--workspace").cmp(&(*lm == "--workspace")))
+    });
+    let mut args = vec![
+        "--expect-policy".into(),
+        env!("RUNBAY_POLICY_ID").into(),
+        "--argv0".into(),
+        cmd[0].clone(),
+    ];
     if opts.allow_network {
         args.push("--network".to_string());
     }
@@ -166,27 +183,57 @@ pub(super) fn arguments(
     Ok(args)
 }
 
-pub(super) fn available(binary: &Path) -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        let probe = || -> Result<bool> {
-            let tmp = tempfile::tempdir()?;
-            let args = arguments(
-                &["/bin/true".into()],
-                tmp.path(),
-                tmp.path(),
-                &[],
-                &Default::default(),
-            )?;
-            Ok(Command::new(binary)
-                .env_clear()
-                .args(args)
-                .output()?
-                .status
-                .success())
-        };
-        probe().unwrap_or(false)
-    })
+pub(super) fn check_available(binary: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::Mutex;
+    // AppArmor attaches by path. Replacement or in-place changes invalidate a successful probe.
+    struct Verified {
+        path: PathBuf,
+        inode: (u64, u64, i64, i64),
+    }
+    static VERIFIED: Mutex<Option<Verified>> = Mutex::new(None);
+    let metadata = fs::metadata(binary)
+        .with_context(|| format!("open Landlock launcher {}", binary.display()))?;
+    let inode = (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    );
+    let mut verified = VERIFIED.lock().unwrap();
+    if verified
+        .as_ref()
+        .is_some_and(|v| v.path == binary && v.inode == inode)
+    {
+        return Ok(());
+    }
+    let version = Command::new(binary)
+        .env_clear()
+        .arg("--print-policy-id")
+        .output()?;
+    ensure!(version.status.success() && version.stdout.strip_suffix(b"\n") == Some(env!("RUNBAY_POLICY_ID").as_bytes()),
+        "Landlock launcher policy mismatch at {}. Reinstall with scripts/install-linux-launcher.sh or set RUNBAY_LANDLOCK_LAUNCHER to the matching binary", binary.display());
+    let tmp = tempfile::tempdir()?;
+    let workspace = fs::canonicalize(tmp.path())?;
+    let args = arguments(
+        &["/bin/true".into()],
+        &workspace,
+        &workspace,
+        &[],
+        &Default::default(),
+    )?;
+    let probe = Command::new(binary).env_clear().args(args).output()?;
+    ensure!(
+        probe.status.success(),
+        "Landlock launcher {} failed its isolation probe: {}",
+        binary.display(),
+        String::from_utf8_lossy(&probe.stderr).trim()
+    );
+    *verified = Some(Verified {
+        path: binary.to_owned(),
+        inode,
+    });
+    Ok(())
 }
 
 pub(super) struct Handshake {
@@ -219,7 +266,7 @@ impl Handshake {
         ensure!(
             reply == b"R",
             "native sandbox setup failed: {}",
-            String::from_utf8_lossy(&reply)
+            String::from_utf8_lossy(reply.strip_prefix(b"R").unwrap_or(&reply))
         );
         Ok(())
     }

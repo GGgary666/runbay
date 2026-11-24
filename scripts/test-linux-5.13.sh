@@ -7,7 +7,7 @@ build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
 mkdir -p "$build/image/dev"
 cc=${KERNEL_CC:-x86_64-linux-gnu-gcc}
-"$cc" -O2 -Wall -Wextra -Werror -static "$repo/crates/runbay-sandbox/native/launcher.c" -o "$build/image/runbay-landlock"
+CC="$cc" sh "$repo/scripts/build-linux-launcher.sh" "$build/image/runbay-landlock"
 "$cc" -O2 -Wall -Wextra -Werror -static "$repo/crates/runbay-sandbox/tests/kernel/init.c" -o "$build/image/init"
 (cd "$build/image" && find . | cpio --quiet -o -H newc) | gzip > "$build/root.cpio.gz"
 if ! timeout 100 qemu-system-x86_64 -accel tcg -cpu max -m 384 -smp 1 -nic none -nographic -no-reboot \

@@ -767,14 +767,6 @@ pub struct MockUpstreamServer {
 
 impl MockUpstreamServer {
     pub async fn start() -> Result<Self> {
-        Self::start_with_chat_reply(|_| Some("Multi-Version Concurrency Control".into())).await
-    }
-
-    /// Return HTTP 400 when the supplied non-streaming chat fixture rejects a request.
-    pub async fn start_with_chat_reply(
-        reply: impl Fn(&serde_json::Value) -> Option<String> + Send + Sync + 'static,
-    ) -> Result<Self> {
-        let reply = Arc::new(reply);
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let seen_auth = Arc::new(Mutex::new(Vec::new()));
@@ -789,11 +781,9 @@ impl MockUpstreamServer {
                         let Ok((stream, _)) = accepted else { break };
                         let io = TokioIo::new(stream);
                         let seen = Arc::clone(&auth_clone);
-                        let reply = Arc::clone(&reply);
                         tokio::spawn(async move {
                             let svc = service_fn(move |req: Request<Incoming>| {
                                 let seen_ref = Arc::clone(&seen);
-                                let reply = Arc::clone(&reply);
                                 async move {
                                     if let Some(a) = req.headers().get("authorization").and_then(|v| v.to_str().ok()) {
                                         seen_ref.lock().push(a.to_string());
@@ -854,13 +844,9 @@ impl MockUpstreamServer {
                                         return Ok::<_, Infallible>(resp);
                                     }
                                     if !is_stream {
-                                        let Some(answer) = reply(&j) else {
-                                            return Ok::<_, Infallible>(json_response(StatusCode::BAD_REQUEST, Bytes::from_static(b"{}")));
-                                        };
                                         let payload = serde_json::json!({
                                             "id": "mock-nonstream-1",
-                                            "model": j["model"],
-                                            "choices": [{"message": {"role": "assistant", "content": answer}}],
+                                            "choices": [{"message": {"role": "assistant", "content": "Multi-Version Concurrency Control"}}],
                                             "usage": {"prompt_tokens": 18, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 0}}
                                         });
                                         return Ok::<_, Infallible>(json_response(StatusCode::OK, Bytes::from(payload.to_string())));

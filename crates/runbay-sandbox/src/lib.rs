@@ -54,10 +54,15 @@ pub struct SandboxedChild {
 impl SandboxedChild {
     /// Release the cgroup before publishing the terminal run event.
     pub async fn finish_resources(&mut self) -> Result<()> {
-        if let Some(group) = self.cgroup.take() {
-            tokio::task::spawn_blocking(move || group.close()).await??;
+        self.finish_resources_with_oom().await.map(|_| ())
+    }
+
+    /// Return whether the kernel recorded a memory-cgroup OOM kill before removing the leaf.
+    pub async fn finish_resources_with_oom(&mut self) -> Result<bool> {
+        match self.cgroup.take() {
+            Some(group) => tokio::task::spawn_blocking(move || group.close_with_oom()).await?,
+            None => Ok(false),
         }
-        Ok(())
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -150,7 +155,6 @@ impl<'a> SandboxCommand<'a> {
     }
 
     fn spawn_async(mut self) -> Result<SandboxedChild> {
-        #[cfg(unix)]
         self.command.process_group(0);
         let cgroup = self.attach_cgroup()?;
         #[allow(unused_mut)]
@@ -160,7 +164,18 @@ impl<'a> SandboxCommand<'a> {
         #[cfg(runbay_native_linux)]
         if let Some(channel) = self.handshake {
             if let Err(error) = channel.wait() {
+                if let Some(pid) = child.id() {
+                    kill_launch_group(pid);
+                }
                 let _ = child.start_kill();
+                // This synchronous entry point runs on the daemon's blocking pool.
+                while child
+                    .try_wait()
+                    .context("reap failed sandbox launch")?
+                    .is_none()
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
                 return Err(error);
             }
         }
@@ -173,6 +188,10 @@ impl<'a> SandboxCommand<'a> {
     }
 
     fn run(mut self) -> Result<SandboxExecResult> {
+        #[cfg(runbay_native_linux)]
+        if self.handshake.is_some() {
+            self.command.process_group(0);
+        }
         let start = Instant::now();
         let cgroup = self.attach_cgroup()?;
         #[allow(unused_mut)]
@@ -183,8 +202,9 @@ impl<'a> SandboxCommand<'a> {
         #[cfg(runbay_native_linux)]
         if let Some(channel) = self.handshake {
             if let Err(error) = channel.wait() {
+                kill_launch_group(child.id());
                 let _ = child.kill();
-                let _ = child.wait();
+                child.wait().context("reap failed sandbox launch")?;
                 return Err(error);
             }
         }
@@ -204,6 +224,14 @@ impl<'a> SandboxCommand<'a> {
             elapsed_ms,
             sandbox_enforced: true,
         })
+    }
+}
+
+#[cfg(runbay_native_linux)]
+fn kill_launch_group(pid: u32) {
+    // The group leader has not been reaped, so its PID cannot be reused here.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
     }
 }
 
@@ -465,14 +493,23 @@ impl LinuxSandbox {
     }
 
     pub fn is_available(&self) -> bool {
-        let Some(binary) = &self.binary else {
-            return false;
-        };
+        self.check_available().is_ok()
+    }
+
+    fn check_available(&self) -> Result<()> {
+        let binary = self
+            .binary
+            .as_deref()
+            .context("requested Linux sandbox backend unavailable")?;
         #[cfg(runbay_native_linux)]
         if self.backend == LinuxBackend::Landlock {
-            return native::available(binary);
+            return native::check_available(binary);
         }
-        Self::bwrap_works(binary)
+        anyhow::ensure!(
+            Self::bwrap_works(binary),
+            "bubblewrap isolation probe failed"
+        );
+        Ok(())
     }
 
     fn bwrap_works(binary: &Path) -> bool {
@@ -529,12 +566,15 @@ impl LinuxSandbox {
         if cmd.is_empty() {
             bail!("sandbox command cannot be empty");
         }
+        let workspace = fs::canonicalize(ws).context("resolve isolated workspace")?;
+        let ws = workspace.as_path();
         #[cfg(target_os = "linux")]
         writable::check_links(ws, &opts.extra_writable_paths)?;
 
         let mut launch = SandboxCommand::new(binary, cmd, ws, "/usr/local/bin:/usr/bin:/bin", opts);
         #[cfg(runbay_native_linux)]
         if self.backend == LinuxBackend::Landlock {
+            native::check_available(binary)?;
             launch.handshake = Some(native::Handshake::install(&mut launch.command)?);
             launch.command.args(native::arguments(
                 cmd,
@@ -662,9 +702,16 @@ impl LocalOsSandbox {
     }
 
     pub fn is_available(&self) -> bool {
+        self.check_available().is_ok()
+    }
+
+    pub fn check_available(&self) -> Result<()> {
         match self {
-            Self::MacOS(s) => s.is_available(),
-            Self::Linux(s) => s.is_available(),
+            Self::MacOS(s) => {
+                anyhow::ensure!(s.is_available(), "macOS Seatbelt launcher unavailable");
+                Ok(())
+            }
+            Self::Linux(s) => s.check_available(),
         }
     }
 
@@ -702,6 +749,8 @@ impl LocalOsSandbox {
         }
     }
 
+    /// Returns a Tokio child after synchronous isolation setup. Call from a blocking task
+    /// when directory walks, the launcher handshake or cgroup cleanup may take time.
     pub fn spawn_async(
         &self,
         cmd: &[String],
@@ -1031,8 +1080,10 @@ mod tests {
     #[tokio::test]
     async fn test_worker_environment_and_output_on_both_entry_points() {
         let pool = TempDir::new().unwrap();
-        let ws = pool.path().join("workspace");
-        fs::create_dir(&ws).unwrap();
+        let real = pool.path().join("workspace");
+        fs::create_dir(&real).unwrap();
+        let ws = pool.path().join("workspace-link");
+        std::os::unix::fs::symlink(&real, &ws).unwrap();
         let sandbox = LocalOsSandbox::new(pool.path(), &[]);
         if !sandbox.is_available() {
             return;
@@ -1064,6 +1115,72 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, async_path.as_bytes());
         assert_eq!(output.stderr, b"worker");
+    }
+
+    #[cfg(runbay_native_linux)]
+    #[tokio::test]
+    async fn failed_handshake_kills_the_process_group_and_reaps_its_leader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("pids");
+        let worker_marker = marker.clone();
+        tokio::task::spawn_blocking(move || {
+            let opts = SandboxRunOptions::default();
+            let mut launch = SandboxCommand::new(
+                Path::new("/usr/bin/python3"),
+                &[],
+                tmp.path(),
+                "/usr/bin:/bin",
+                &opts,
+            );
+            launch
+                .command
+                .args([
+                    "-c",
+                    r#"
+import os, subprocess, sys, time
+child = subprocess.Popen(["/bin/sleep", "5"])
+with open(sys.argv[1], "w") as marker:
+    print(os.getpid(), child.pid, file=marker)
+fd = int(sys.argv[-1])
+os.write(fd, b"setup failed")
+os.close(fd)
+time.sleep(5)
+"#,
+                ])
+                .arg(worker_marker);
+            launch.handshake = Some(native::Handshake::install(&mut launch.command).unwrap());
+            assert!(launch
+                .spawn_async()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("setup failed"));
+            let pids = fs::read_to_string(&marker).unwrap();
+            let mut pids = pids.split_whitespace().map(|p| p.parse::<i32>().unwrap());
+            let leader = pids.next().unwrap();
+            let descendant = pids.next().unwrap();
+            assert_eq!(
+                unsafe { libc::waitpid(leader, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while let Ok(stat) = fs::read_to_string(format!("/proc/{descendant}/stat")) {
+                if stat.contains(") Z ") {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "descendant survived failed launch"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

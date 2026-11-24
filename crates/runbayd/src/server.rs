@@ -171,7 +171,10 @@ async fn handle_http_request(sup: Arc<DaemonSupervisor>, req: Request<Incoming>)
 
     // GET /v1/status
     if method == Method::GET && path == "/v1/status" {
-        return match sup.status() {
+        let status = tokio::task::spawn_blocking(move || sup.status())
+            .await
+            .unwrap_or_else(|e| Err(e.into()));
+        return match status {
             Ok(st) => json_resp(StatusCode::OK, serde_json::to_value(st).unwrap()),
             Err(e) => error_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,

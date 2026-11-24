@@ -511,127 +511,34 @@ async fn test_daemon_register_submit_sse_gateway_and_sandbox_isolation() {
     assert_eq!(agent_after["active_leases"], 0);
 }
 
-#[cfg(target_os = "linux")]
-mod wiki_sample {
-    use super::MockUpstreamServer;
-    pub const NOTE: &str = include_str!("../../../examples/cowiki/paper-note.md");
-    pub const QUESTION: &str = "这份论文笔记里的主要评测指标是什么？";
-    pub const ANSWER: &str = "主要评测指标是 Macro-F1（宏平均 F1）。";
-
-    pub async fn model() -> MockUpstreamServer {
-        MockUpstreamServer::start_with_chat_reply(|body| {
-            let messages = body["messages"].as_array()?;
-            let message = messages.iter().find(|m| m["role"] == "user")?["content"].as_str()?;
-            (body["model"] == "deepseek-flash"
-                && message.contains(QUESTION)
-                && message.contains(NOTE))
-            .then(|| ANSWER.to_owned())
-        })
-        .await
-        .unwrap()
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn test_daemon_cowiki_qa_through_unix_socket() {
-    use wiki_sample::{ANSWER, NOTE, QUESTION};
-    let tmp = TempDir::new().unwrap();
-    let workspace = tmp.path().join("wiki");
-    fs::create_dir(&workspace).unwrap();
-    fs::write(workspace.join("paper-note.md"), NOTE).unwrap();
-    let upstream = wiki_sample::model().await;
-    let daemon = SpawnedDaemon::spawn(
-        &tmp.path().join("state"),
-        "rb_ctl_cowiki_test",
-        &[
-            "--allow-workspace-root",
-            workspace.to_str().unwrap(),
-            "--enable-cowiki-adapter",
-            "--upstream-url",
-            &upstream.base_url(),
-        ],
-        &[("RUNBAY_UPSTREAM_API_KEY", "cowiki-mock-upstream-key")],
-    );
-    let client = reqwest::Client::new();
-    let registered = client
-        .post(format!("{}/agents", daemon.base_url))
-        .bearer_auth(&daemon.token)
-        .json(&serde_json::json!({
-            "agent_id": "wiki-qa",
-            "runtime": "cowiki",
-            "workspace_dir": workspace,
-        }))
-        .send()
-        .await
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+#[test]
+fn self_check_rejects_an_incompatible_launcher_override() {
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_runbayd"))
+        .arg("self-check")
+        .env("RUNBAY_SANDBOX_BACKEND", "landlock")
+        .env("RUNBAY_LANDLOCK_LAUNCHER", "/bin/true")
+        .output()
         .unwrap();
-    assert_eq!(registered.status(), 201);
-
-    let unavailable = client.post(format!("{}/agents/wiki-qa/run", daemon.base_url))
-        .bearer_auth(&daemon.token).json(&serde_json::json!({
-            "prompt": QUESTION, "resource_limits": {"cpu_percent": 20, "memory_mib": 64, "max_pids": 16}
-        })).send().await.unwrap();
-    assert_eq!(unavailable.status(), 400);
-
-    let submitted = client
-        .post(format!("{}/agents/wiki-qa/run", daemon.base_url))
-        .bearer_auth(&daemon.token)
-        .json(&serde_json::json!({
-            "prompt": QUESTION,
-            "allowed_model": "deepseek-flash",
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(submitted.status(), 202);
-    let run: serde_json::Value = submitted.json().await.unwrap();
-    let run_id = run["run_id"].as_str().unwrap();
-    let events = collect_run_sse(&client, &daemon, run_id, None).await;
-    assert_eq!(
-        events.last().map(|event| event.event.as_str()),
-        Some("run.succeeded"),
-        "{events:?}"
-    );
-    let answer = events
-        .iter()
-        .find(|event| event.event == "agent.event" && event.data["data"]["type"] == "cowiki.answer")
-        .map(|event| &event.data["data"])
-        .expect("expected a CoWiki answer event");
-    println!("Offline CoWiki answer: {answer}");
-    assert_eq!(answer["answer"], ANSWER);
-    assert_eq!(answer["requested_model"], "deepseek-flash");
-    assert_eq!(answer["model"], "deepseek-flash");
-    assert_eq!(answer["http_status"], 200);
-    assert_eq!(
-        answer["sources"],
-        serde_json::json!([{"path": "paper-note.md", "start_line": 1, "end_line": NOTE.lines().count()}])
-    );
-
-    let final_run = wait_for_run_state(&client, &daemon, run_id, &["succeeded"]).await;
-    assert_eq!(final_run["sandbox_enforced"], true);
-    assert_eq!(final_run["network_isolated"], true);
-    assert_eq!(final_run["secretless_gateway"], true);
-    assert_eq!(
-        final_run["gateway_transport"],
-        runbay_sandbox::LocalOsSandbox::new(std::env::temp_dir(), &[]).gateway_transport()
-    );
-    assert_eq!(
-        upstream.seen_auth_headers(),
-        ["Bearer cowiki-mock-upstream-key"]
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("launcher policy mismatch at /bin/true")
     );
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires a writable delegated cgroup v2 subtree; exercised by Linux CI"]
-async fn test_daemon_cgroup_cancel_timeout_and_concurrent_qa() {
+async fn test_daemon_cgroup_cancel_timeout_and_concurrent_gateway() {
     use serde_json::json;
     let parent = PathBuf::from(std::env::var_os("RUNBAY_CGROUP_ROOT").expect("delegated parent"));
     let tmp = TempDir::new().unwrap();
-    let workspace = tmp.path().join("wiki");
+    let workspace = tmp.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
-    fs::write(workspace.join("paper-note.md"), wiki_sample::NOTE).unwrap();
-    let upstream = wiki_sample::model().await;
+    let upstream = MockUpstreamServer::start().await.unwrap();
     let mut daemon = SpawnedDaemon::spawn(
         &tmp.path().join("state"),
         "rb_ctl_limit_test",
@@ -644,7 +551,6 @@ async fn test_daemon_cgroup_cancel_timeout_and_concurrent_qa() {
             "160",
             "--sandbox-max-pids",
             "48",
-            "--enable-cowiki-adapter",
             "--enable-fixture-adapter",
             "--allow-workspace-root",
             workspace.to_str().unwrap(),
@@ -654,11 +560,11 @@ async fn test_daemon_cgroup_cancel_timeout_and_concurrent_qa() {
         &[("RUNBAY_UPSTREAM_API_KEY", "test-key")],
     );
     let client = reqwest::Client::new();
-    for runtime in ["cowiki", "fixture"] {
+    for agent in ["gateway", "fixture"] {
         let response = client
             .post(format!("{}/agents", daemon.base_url))
             .bearer_auth(&daemon.token)
-            .json(&json!({"agent_id":runtime, "runtime":runtime, "workspace_dir":workspace}))
+            .json(&json!({"agent_id":agent, "runtime":"fixture", "workspace_dir":workspace}))
             .send()
             .await
             .unwrap();
@@ -717,8 +623,8 @@ async fn test_daemon_cgroup_cancel_timeout_and_concurrent_qa() {
                 "worker and its child should share the run's cgroup"
             );
             let peer = submit(
-                "cowiki",
-                json!({"prompt":wiki_sample::QUESTION, "allowed_model":"deepseek-flash"}),
+                "gateway",
+                json!({"prompt":json!({"action":"call_gateway", "model":"test-model", "check_direct_net":true}).to_string(), "allowed_model":"test-model"}),
             )
             .await
             .unwrap();
@@ -729,9 +635,21 @@ async fn test_daemon_cgroup_cancel_timeout_and_concurrent_qa() {
             assert!(events.iter().any(|e| e.event == "run.started"
                 && e.data["data"]["resource_limits"]
                     == json!({"cpu_percent":90,"memory_mib":160,"max_pids":48})));
-            assert!(events
+            let gateway = events
                 .iter()
-                .any(|e| e.data["data"]["answer"] == wiki_sample::ANSWER));
+                .find(|e| e.data["data"]["type"] == "fixture.gateway_ok")
+                .expect("gateway response");
+            assert_eq!(gateway.data["data"]["direct_net_blocked"], true);
+            assert!(gateway.data["data"]["response_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Multi-Version Concurrency Control"));
+            assert_eq!(upstream.seen_auth_headers(), ["Bearer test-key"]);
+            let started = events.iter().find(|e| e.event == "run.started").unwrap();
+            assert_eq!(
+                started.data["data"]["gateway_transport"],
+                runbay_sandbox::LocalOsSandbox::new(&workspace, &[]).gateway_transport()
+            );
             assert_eq!(events.last().unwrap().event, "run.succeeded");
             assert!(!parent.join(format!("runbay-{peer_id}")).exists());
             assert!(path.exists());
@@ -746,6 +664,30 @@ async fn test_daemon_cgroup_cancel_timeout_and_concurrent_qa() {
         }
         assert!(!path.exists(), "terminal run still owns a cgroup");
     }
+
+    // Charge a bounded allocation to a sleeping fixture's leaf and verify the daemon verdict.
+    let limited = submit("fixture", json!({
+        "prompt":json!({"action":"sleep_with_grandchild","sleep_secs":20,"pid_file":"oom.json"}).to_string(),
+        "resource_limits":{"cpu_percent":50,"memory_mib":48,"max_pids":32}
+    })).await.unwrap();
+    assert_eq!(limited.status(), 202);
+    let limited: serde_json::Value = limited.json().await.unwrap();
+    let limited_id = limited["run_id"].as_str().unwrap();
+    wait_for_run_state(&client, &daemon, limited_id, &["running"]).await;
+    let leaf = parent.join(format!("runbay-{limited_id}"));
+    let allocation = tokio::process::Command::new("/usr/bin/python3")
+        .args([
+            "-c",
+            "import sys; open(sys.argv[1], 'w').write('0'); buf = bytearray(64 * 1024 * 1024)",
+        ])
+        .arg(leaf.join("cgroup.procs"))
+        .status()
+        .await
+        .unwrap();
+    assert!(!allocation.success());
+    let failed = wait_for_run_state(&client, &daemon, limited_id, &["failed"]).await;
+    assert_eq!(failed["error_code"], "oom_killed");
+    assert!(!leaf.exists());
 
     let interrupted = submit("fixture", json!({
         "prompt": json!({"action":"sleep_with_grandchild","sleep_secs":30,"pid_file":"restart.json"}).to_string()

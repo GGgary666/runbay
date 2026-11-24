@@ -18,6 +18,11 @@ fn readonly_names_remain_immutable_during_concurrent_workspace_updates() {
     fs::write(shared.join("note"), "original").unwrap();
     fs::hard_link(shared.join("note"), shared.join("second-name")).unwrap();
     symlink(shared.join("second-name"), ws.join("reference")).unwrap();
+    symlink(shared.join("note"), ws.join("alternate")).unwrap();
+    let reference =
+        std::ffi::CString::new(ws.join("reference").as_os_str().as_encoded_bytes()).unwrap();
+    let alternate =
+        std::ffi::CString::new(ws.join("alternate").as_os_str().as_encoded_bytes()).unwrap();
     let sb = LocalOsSandbox::new(&pool, &[]);
     if !sb.is_available() {
         assert!(
@@ -38,13 +43,19 @@ fn readonly_names_remain_immutable_during_concurrent_workspace_updates() {
         let changing = scope.spawn(|| {
             let mut updates = 0;
             while !finished.load(Ordering::Acquire) {
-                let target = if updates % 2 == 0 {
-                    "note"
-                } else {
-                    "second-name"
+                // Keep both directory entries alive throughout the lookup, including on
+                // the other bind mount. Nothing vanishes while the workers are reading.
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_renameat2,
+                        libc::AT_FDCWD,
+                        reference.as_ptr(),
+                        libc::AT_FDCWD,
+                        alternate.as_ptr(),
+                        libc::RENAME_EXCHANGE,
+                    )
                 };
-                symlink(shared.join(target), ws.join("replacement")).unwrap();
-                fs::rename(ws.join("replacement"), ws.join("reference")).unwrap();
+                assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
                 updates += 1;
                 std::thread::yield_now();
             }
@@ -112,6 +123,7 @@ async fn native_launch_error_precedes_started_child() {
         .err()
         .expect("exec must fail");
     assert!(error.to_string().contains("Permission denied"), "{error:#}");
+    assert!(!error.to_string().contains("failed: R/"), "{error:#}");
 }
 
 #[test]
@@ -138,4 +150,42 @@ fn writable_files_must_own_all_their_hard_links() {
         error.to_string().contains("hard link outside its scope"),
         "{error:#}"
     );
+}
+
+#[test]
+fn native_worker_preserves_virtualenv_argv0_and_nested_readonly_paths() {
+    let tmp = tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let data = tmp.path().join("input");
+    let nested = data.join("nested");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir_all(&nested).unwrap();
+    let sb = LocalOsSandbox::new(&workspace, &[]);
+    if sb.gateway_transport() != "linux_landlock_seccomp_unix_socket" {
+        return;
+    }
+    sb.check_available().unwrap();
+    let venv = workspace.join("venv");
+    let interpreter = venv.join("bin/python3");
+    fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+    fs::write(
+        venv.join("pyvenv.cfg"),
+        "home = /usr/bin\ninclude-system-site-packages = false\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("/usr/bin/python3", &interpreter).unwrap();
+    let command = [
+        interpreter.to_str().unwrap().into(),
+        "-c".into(),
+        "import sys; print(sys.prefix)".into(),
+    ];
+    for paths in [vec![nested.clone(), data.clone()], vec![data, nested]] {
+        let opts = SandboxRunOptions {
+            extra_readonly_paths: paths,
+            ..Default::default()
+        };
+        let result = sb.run(&command, &workspace, &opts).unwrap();
+        assert_eq!(result.returncode, 0, "{}", result.stderr);
+        assert_eq!(result.stdout.trim(), venv.to_str().unwrap());
+    }
 }

@@ -20,6 +20,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* Linux UAPI since 5.11. Older libc headers may not expose the flag. */
+#ifndef CLOSE_RANGE_CLOEXEC
+#define CLOSE_RANGE_CLOEXEC (1U << 2)
+#endif
+
 static int ready = -1;
 
 static void fail(const char *stage) {
@@ -78,7 +83,8 @@ static void pin(struct exposure *e) {
     /* Distribution-owned compatibility symlinks are allowed. Run-specific paths were
      * resolved by the daemon and must never follow a replacement symlink at launch. */
     if (!strcmp(source, "/bin") || !strcmp(source, "/sbin") || !strcmp(source, "/lib")
-        || !strcmp(source, "/lib64") || !strcmp(source, "/etc/resolv.conf")) {
+        || !strcmp(source, "/lib64") || !strcmp(source, "/etc/resolv.conf")
+        || !strcmp(source, "/etc/ssl/certs")) {
         if (!realpath(source, resolved)) fail(source);
         source = resolved;
     }
@@ -159,6 +165,11 @@ static void filesystem(struct exposure *items, int count) {
 /* Executed once per run. The handshake descriptor closes on successful exec, and reports
  * any setup/exec error to the daemon before it marks the run as started. */
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--print-policy-id")) {
+        puts(RUNBAY_POLICY_ID);
+        return 0;
+    }
+    char *worker_argv0 = NULL;
     struct exposure *items = calloc(argc, sizeof(*items));
     if (!items) fail("allocate exposures");
     const char *workspace = NULL;
@@ -172,6 +183,11 @@ int main(int argc, char **argv) {
             if (ready < 3 || fcntl(ready, F_SETFD, FD_CLOEXEC)) fail("setup handshake");
             continue;
         }
+        if (!strcmp(option, "--expect-policy")) {
+            if (strcmp(argv[i], RUNBAY_POLICY_ID)) { errno = EPROTO; fail("launcher policy mismatch"); }
+            continue;
+        }
+        if (!strcmp(option, "--argv0")) { worker_argv0 = argv[i]; continue; }
         int ws = !strcmp(option, "--workspace"), rw = !strcmp(option, "--rw");
         int dev = !strcmp(option, "--device");
         if ((!ws && !rw && !dev && strcmp(option, "--ro")) || !safe_absolute(argv[i])) {
@@ -216,6 +232,8 @@ int main(int argc, char **argv) {
     /* Prevent unrelated inherited descriptors from carrying host authority across exec. */
     if (syscall(SYS_close_range, 3U, ~0U, CLOSE_RANGE_CLOEXEC)) fail("seal file descriptors");
     if (ready >= 0 && write(ready, "R", 1) != 1) fail("notify daemon");
-    execv(argv[i], &argv[i]);
-    fail(argv[i]);
+    const char *program = argv[i];
+    if (worker_argv0) argv[i] = worker_argv0;
+    execv(program, &argv[i]);
+    fail(program);
 }

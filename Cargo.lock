@@ -1005,6 +1005,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "serde",
+ "sha2",
  "tempfile",
  "tokio",
  "walkdir",
